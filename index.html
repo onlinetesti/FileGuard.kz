@@ -234,9 +234,7 @@ const CONFIG = {
   DEFAULT_ADMIN: {
     email: "admin@fileguard.local",
     password: "Admin123!" 
-  },
-  // Прокси для обхода CORS при скачивании с Google Диска
-  CORS_PROXY: "https://api.allorigins.win/raw?url="
+  }
 };
 
 class ApiError extends Error {
@@ -954,7 +952,6 @@ async function viewFiles() {
           <button class="btn secondary small" data-act="verify" data-id="${esc(f.id)}">Проверить</button>
           <button class="btn warn small" data-act="edit" data-id="${esc(f.id)}">Редактировать</button>
           <button class="btn danger small" data-act="delete" data-id="${esc(f.id)}">Удалить</button>
-          ${f.gdrive_url ? `<button class="btn info small" data-act="sync" data-id="${esc(f.id)}" title="Синхронизировать с GDrive">🔄</button>` : ""}
         </td>
       </tr>`).join("");
   }
@@ -1087,38 +1084,6 @@ async function viewFiles() {
     };
   }
 
-  // Синхронизация с Google Диском
-  async function syncFromGDrive(rec) {
-    if (!rec.gdrive_url) return toast("Нет ссылки на Google Диск", "error");
-    if (busy) return;
-    busy = true;
-    toast("Синхронизация с Google Диском...", "info");
-    
-    try {
-      // Пытаемся скачать файл через прокси
-      const res = await fetch(CONFIG.CORS_PROXY + encodeURIComponent(rec.gdrive_url));
-      if (!res.ok) throw new Error("Не удалось скачать файл с Google Диска (проверьте доступ)");
-      
-      const blob = await res.blob();
-      const file = new File([blob], rec.file_name);
-      const hash = await sha256File(file);
-      
-      if (hash === rec.file_hash) {
-        toast("Файл на Google Диске не изменился", "info");
-      } else {
-        if (confirm(`Файл на Google Диске изменился!\n\nБыло: ${rec.file_hash}\nСтало: ${hash}\n\nОбновить запись в базе?`)) {
-          await FG.updateFile(rec.id, hash, file.size, rec.gdrive_url);
-          toast("Запись обновлена по данным с Google Диска", "success");
-        }
-      }
-      await refresh(true);
-    } catch (e) {
-      toast(e.message, "error");
-    } finally {
-      busy = false;
-    }
-  }
-
   async function deleteRecord(rec) {
     if (!confirm(`Удалить запись «${rec.file_name}»?`)) return;
     try {
@@ -1143,7 +1108,6 @@ async function viewFiles() {
     
     if (b.dataset.act === "delete") return deleteRecord(rec);
     if (b.dataset.act === "edit") return openEditor(rec);
-    if (b.dataset.act === "sync") return syncFromGDrive(rec);
     
     rowAction = { type: b.dataset.act, rec };
     rowInput.click();
