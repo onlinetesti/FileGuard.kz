@@ -1,5 +1,0 @@
-# Скопируйте в .dev.vars для локального запуска: npx wrangler dev
-SHEETDB_URL=https://sheetdb.io/api/v1/5v95w5jew3777
-JWT_SECRET=замените-на-длинную-случайную-строку
-ADMIN_EMAILS=admin@example.com
-# SHEETDB_TOKEN=
