@@ -125,6 +125,7 @@ input:focus, select:focus { outline: 2px solid var(--accent-2); border-color: tr
 .badge.add { color: var(--ok); border-color: #1f5130; background: #12261a; }
 .badge.edit { color: var(--warn); border-color: #5a4713; background: #2a2210; }
 .badge.del { color: var(--bad); border-color: #5b2a2a; background: #2b1618; }
+.badge.check { color: var(--info); border-color: #1f4170; background: #101e30; }
 
 main { max-width: 1200px; margin: 0 auto; padding: 24px; }
 .card { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; margin-bottom: 20px; }
@@ -278,7 +279,7 @@ const DB = {
 };
 
 /* ==========================================================================
-   Хэширование
+   Хэширование и генерация ID
    ========================================================================== */
 const enc = new TextEncoder();
 const PBKDF2_ITER = 100000;
@@ -294,6 +295,22 @@ const b64u = {
   enc: (buf) => b64.enc(buf).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""),
   dec(str) { str = str.replace(/-/g, "+").replace(/_/g, "/"); while (str.length % 4) str += "="; return b64.dec(str); },
 };
+
+// Генерация ТОЛЬКО цифрового ID (например, 12-значное число)
+function generateNumericId() {
+  return String(Math.floor(100000000000 + Math.random() * 900000000000));
+}
+
+// Форматирование даты в вид 16.11.2026, 15:25:15
+function formatDateTime(isoString) {
+  if (!isoString) return "—";
+  const d = new Date(isoString);
+  if (isNaN(d.getTime())) return isoString;
+  const pad = (n) => String(n).padStart(2, "0");
+  const datePart = `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()}`;
+  const timePart = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  return `${datePart}, ${timePart}`;
+}
 
 function timingSafeEqual(a, b) {
   if (a.length !== b.length) return false;
@@ -369,7 +386,7 @@ const FG = (function () {
       if (existing.length === 0) {
         const ts = now();
         await DB.insert("Users", {
-          client_id: crypto.randomUUID(),
+          client_id: generateNumericId(),
           email: adminEmail,
           password_hash: await hashPassword(CONFIG.DEFAULT_ADMIN.password),
           registration_date: ts,
@@ -411,7 +428,7 @@ const FG = (function () {
     if (existing.length) throw new ApiError(409, "Пользователь с таким email уже зарегистрирован");
     const ts = now();
     await DB.insert("Users", {
-      client_id: crypto.randomUUID(),
+      client_id: generateNumericId(),
       email,
       password_hash: await hashPassword(password),
       registration_date: ts,
@@ -463,9 +480,11 @@ const FG = (function () {
       const j = await r.json();
       ip = j.ip || "unknown";
     } catch {}
+    // Форматируем дату в нужный вид ПЕРЕД записью в БД
+    const formattedDate = formatDateTime(now());
     await DB.insert("AuditLog", {
-      id: crypto.randomUUID(), id_client: user.client_id, email: user.email, client_ip: ip,
-      file_name: fileName, change, old_hash: oldHash || "", new_hash: newHash || "", datetime: now(),
+      id: generateNumericId(), id_client: user.client_id, email: user.email, client_ip: ip,
+      file_name: fileName, change, old_hash: oldHash || "", new_hash: newHash || "", datetime: formattedDate,
     });
   }
 
@@ -479,14 +498,14 @@ const FG = (function () {
     const files = await DB.all("Hashes");
     if (files.find((f) => f.file_name === file_name)) throw new ApiError(409, `Файл «${file_name}» уже есть в базе.`);
     if (files.find((f) => f.file_hash === file_hash)) throw new ApiError(409, `Файл с таким хэшем уже есть в базе.`);
-    const row = { id: crypto.randomUUID(), file_name, file_hash, file_size: String(file_size), date_added: now(), added_by: user.client_id };
+    const row = { id: generateNumericId(), file_name, file_hash, file_size: String(file_size), date_added: now(), added_by: user.client_id };
     await DB.insert("Hashes", row);
     await audit(user, file_name, "Добавление", "", file_hash);
     return { ok: true };
   }
 
   async function verifyFile(file_hash, id, file_name) {
-    requireApproved(await getAuth());
+    const user = await getAuth(); requireApproved(user);
     file_hash = cleanHash(file_hash);
     const [files, users] = await Promise.all([DB.all("Hashes"), DB.all("Users")]);
     const emails = new Map(users.map((u) => [u.client_id, u.email]));
@@ -497,6 +516,8 @@ const FG = (function () {
       record = files.find((f) => f.file_name === name) || null;
     }
     if (record) {
+      // ЛОГИРОВАНИЕ ПРОВЕРКИ
+      await audit(user, record.file_name, "Проверка", record.file_hash, file_hash);
       return {
         result: record.file_hash === file_hash ? "match" : "changed",
         record: { id: record.id, file_name: record.file_name, file_hash: record.file_hash, file_size: Number(record.file_size) || 0, date_added: record.date_added, added_by: record.added_by, added_by_email: emails.get(record.added_by) || "" }
@@ -531,7 +552,14 @@ const FG = (function () {
   async function listAudit() {
     const user = await getAuth(); requireApproved(user);
     const rows = await DB.all("AuditLog");
-    rows.sort((a, b) => String(b.datetime).localeCompare(String(a.datetime)));
+    // Сортируем по дате. Поскольку мы пишем дату в формате ДД.ММ.ГГГГ, нужно преобразовать для сортировки
+    rows.sort((a, b) => {
+      const parse = (s) => {
+        const m = String(s).match(/^(\d{2})\.(\d{2})\.(\d{4}),\s(\d{2}):(\d{2}):(\d{2})$/);
+        return m ? new Date(m[3], m[2]-1, m[1], m[4], m[5], m[6]).getTime() : 0;
+      };
+      return parse(b.datetime) - parse(a.datetime);
+    });
     const out = rows.slice(0, 500).map((r) => ({
       id: r.id, id_client: r.id_client, email: r.email, client_ip: user.isAdmin ? r.client_ip : "",
       file_name: r.file_name, change: r.change, old_hash: r.old_hash, new_hash: r.new_hash, datetime: r.datetime,
@@ -639,7 +667,18 @@ async function route() {
     if (v === "login") return await viewLogin(q);
     if (v === "register") return viewRegister();
     if (v === "pending") return await viewPending();
-    if (v === "admin") return await viewAdmin();
+    if (v === "admin") {
+      try {
+        const me = await FG.me();
+        if (!me.isAdmin) {
+          toast("Доступ запрещён. Вы не администратор.", "error");
+          return location.hash = "#/files";
+        }
+        return await viewAdmin();
+      } catch (e) {
+        return FG.logout();
+      }
+    }
     return await viewFiles();
   } catch (e) {
     app.innerHTML = authShell(`<div class="alert error">${esc(e.message)}</div><button class="btn block" onclick="location.reload()">Обновить</button>`);
@@ -809,7 +848,7 @@ async function viewFiles() {
       <div class="card-head"><h2>Проверка и добавление файла</h2></div>
       <div class="dropzone" id="dropzone">
         <div class="big">Перетащите файл сюда или нажмите для выбора</div>
-        <div class="muted">SHA-256 считается в вашем браузере. Система найдёт запись в базе.</div>
+        <div class="muted">SHA-256 считается в вашем браузере. Система найдёт запись в базе и покажет результат. Если файл изменился — вы сможете обновить запись прямо здесь.</div>
       </div>
       <input type="file" id="fileInput" class="hidden">
       <div id="result"></div>
@@ -835,6 +874,7 @@ async function viewFiles() {
           <button class="tab" data-f="Добавление">Добавление</button>
           <button class="tab" data-f="Изменение">Изменение</button>
           <button class="tab" data-f="Удаление">Удаление</button>
+          <button class="tab" data-f="Проверка">Проверка</button>
         </div>
         <input type="search" class="search" id="auditSearch" placeholder="Поиск по журналу">
       </div>
@@ -856,7 +896,7 @@ async function viewFiles() {
       if (!alive()) return;
       files = f.files; events = a.events; showIp = a.showIp; auditTotal = a.total;
       renderFiles(); renderAudit();
-      $("liveFiles").textContent = "обновлено " + new Date().toLocaleTimeString("ru-RU");
+      $("liveFiles").textContent = "обновлено " + formatDateTime(now());
     } catch (e) {
       if (e.status === 401 || e.status === 403) return FG.logout(e.data?.status);
       if (!silent) toast(e.message, "error");
@@ -888,7 +928,7 @@ async function viewFiles() {
       </tr>`).join("");
   }
 
-  const badge = (c) => `<span class="badge ${c === "Добавление" ? "add" : c === "Изменение" ? "edit" : "del"}">${esc(c)}</span>`;
+  const badge = (c) => `<span class="badge ${c === "Добавление" ? "add" : c === "Изменение" ? "edit" : c === "Удаление" ? "del" : "check"}">${esc(c)}</span>`;
 
   function renderAudit() {
     if (!alive()) return;
@@ -905,7 +945,7 @@ async function viewFiles() {
     }
     $("auditBody").innerHTML = list.map((e) => `
       <tr>
-        <td>${fmtDate(e.datetime)}</td>
+        <td>${esc(e.datetime)}</td>
         <td>${esc(e.email)}<div class="muted mono" style="font-size:.72rem">${esc(e.id_client)}</div></td>
         ${showIp ? `<td class="mono">${esc(e.client_ip)}</td>` : ""}
         <td>${esc(e.file_name)}</td>
@@ -924,9 +964,9 @@ async function viewFiles() {
         <dl class="kv"><dt>SHA-256</dt><dd>${hashHtml(r.hash)}</dd><dt>В базе с</dt><dd>${fmtDate(rec.date_added)}</dd></dl></div>`;
     } else if (r.result === "changed") {
       html = `<div class="result changed"><h3>⚠️ Обнаружены изменения</h3>
-        <p>Хэш файла «${esc(r.fileName)}» не совпадает с сохранённым.</p>
+        <p>Хэш файла «${esc(r.fileName)}» не совпадает с сохранённым. Вы можете обновить запись прямо сейчас.</p>
         <dl class="kv"><dt>Хэш в базе</dt><dd>${hashHtml(rec.file_hash)}</dd><dt>Хэш файла</dt><dd>${hashHtml(r.hash)}</dd></dl>
-        <div class="actions"><button class="btn warn" id="resUpdate">Принять новую версию</button></div></div>`;
+        <div class="actions"><button class="btn warn" id="resUpdate">Принять новую версию (обновить запись)</button></div></div>`;
     } else if (r.result === "renamed") {
       html = `<div class="result renamed"><h3>ℹ️ Файл найден под другим именем</h3>
         <p>Содержимое совпадает с записью «${esc(rec.file_name)}».</p>
@@ -1100,7 +1140,7 @@ async function viewAdmin() {
       const r = await FG.adminListUsers();
       if (!alive()) return;
       users = r.users; render();
-      $("live").textContent = "обновлено " + new Date().toLocaleTimeString("ru-RU");
+      $("live").textContent = "обновлено " + formatDateTime(now());
     } catch (e) {
       if (e.status === 401 || e.status === 403) return FG.logout();
       if (!silent) toast(e.message, "error");
