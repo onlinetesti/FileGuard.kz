@@ -60,11 +60,11 @@ code, .mono { font-family: var(--mono); }
 .btn.block { width: 100%; }
 
 label { display: block; font-size: .85rem; color: var(--muted); margin-bottom: .3em; }
-input[type=text], input[type=email], input[type=password], input[type=search], select {
+input[type=text], input[type=email], input[type=password], input[type=search], select, textarea {
   width: 100%; background: var(--bg); color: var(--text);
   border: 1px solid var(--border); border-radius: 8px; padding: .65em .8em; font: inherit;
 }
-input:focus, select:focus { outline: 2px solid var(--accent-2); border-color: transparent; }
+input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent-2); border-color: transparent; }
 .field { margin-bottom: 1em; }
 
 /* ---------- экран авторизации ---------- */
@@ -203,6 +203,19 @@ td.actions { white-space: nowrap; display: flex; gap: 6px; flex-wrap: wrap; }
   flex: 1; padding: 8px; border: none; background: transparent; color: var(--muted); font-weight: 600; cursor: pointer; border-radius: 8px; transition: all 0.2s;
 }
 .role-btn.active { background: var(--panel-2); color: var(--text); box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
+
+/* Модальное окно для редактирования */
+.modal-overlay {
+  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  background: rgba(0,0,0,0.7); display: grid; place-items: center; z-index: 100;
+}
+.modal {
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+  width: 100%; max-width: 600px; padding: 24px; box-shadow: 0 10px 40px rgba(0,0,0,0.5);
+}
+.modal h2 { margin-top: 0; }
+.modal textarea { min-height: 150px; resize: vertical; margin-bottom: 1em; }
+.modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
 </style>
 </head>
 <body>
@@ -214,9 +227,9 @@ td.actions { white-space: nowrap; display: flex; gap: 6px; flex-wrap: wrap; }
    НАСТРОЙКИ
    ========================================================================== */
 const CONFIG = {
-  // НОВЫЙ API
+  // ВАШ НОВЫЙ API
   SHEETDB_URL: "https://sheetdb.io/api/v1/s4vw7333lauzm",
-  SHEETDB_TOKEN: "", // Оставьте пустым, если в SheetDB "No authentication"
+  SHEETDB_TOKEN: "", 
   DEFAULT_ADMIN: {
     email: "admin@fileguard.local",
     password: "Admin123!" 
@@ -238,40 +251,29 @@ const DB = {
   async call(path, sheet, opts = {}) {
     const base = CONFIG.SHEETDB_URL.replace(/\/+$/, "");
     const headers = { "Content-Type": "application/json" };
-    
     if (CONFIG.SHEETDB_TOKEN && CONFIG.SHEETDB_TOKEN.trim() !== "") {
       headers.Authorization = "Bearer " + CONFIG.SHEETDB_TOKEN;
     }
-
     const sep = path.includes("?") ? "&" : "?";
     const url = `${base}${path}${sep}sheet=${encodeURIComponent(sheet)}`;
-
     let res;
     try {
       res = await fetch(url, { ...opts, headers });
     } catch (e) {
       throw new ApiError(0, "Нет связи с сервером (SheetDB)");
     }
-
     const text = await res.text();
     let data = null;
-    try {
-      data = text ? JSON.parse(text) : null;
-    } catch {
-      data = text;
-    }
-
+    try { data = text ? JSON.parse(text) : null; } catch { data = text; }
     if (!res.ok) {
       let msg = `SheetDB ${res.status}: `;
-      if (res.status === 401) msg += "Таблица не публичная или неверный токен. Проверьте настройки доступа в SheetDB.";
-      else if (res.status === 404) msg += "Лист не найден. Проверьте имя листа.";
+      if (res.status === 401) msg += "Таблица не публичная или неверный токен.";
+      else if (res.status === 404) msg += "Лист не найден.";
       else msg += typeof data === "string" ? data : JSON.stringify(data);
       throw new ApiError(res.status, msg, data);
     }
-
     return data;
   },
-
   all: (sheet) => DB.call("", sheet).then(r => Array.isArray(r) ? r : []),
   find: (sheet, field, value) => DB.call(`/search?${encodeURIComponent(field)}=${encodeURIComponent(value)}&casesensitive=true`, sheet).then(r => Array.isArray(r) ? r : []),
   insert: (sheet, row) => DB.call("", sheet, { method: "POST", body: JSON.stringify({ data: [row] }) }),
@@ -280,7 +282,7 @@ const DB = {
 };
 
 /* ==========================================================================
-   Хэширование и генерация ID
+   Хэширование и утилиты
    ========================================================================== */
 const enc = new TextEncoder();
 const PBKDF2_ITER = 100000;
@@ -297,12 +299,10 @@ const b64u = {
   dec(str) { str = str.replace(/-/g, "+").replace(/_/g, "/"); while (str.length % 4) str += "="; return b64.dec(str); },
 };
 
-// Генерация ТОЛЬКО цифрового ID (например, 12-значное число)
 function generateNumericId() {
   return String(Math.floor(100000000000 + Math.random() * 900000000000));
 }
 
-// Форматирование даты в вид 16.11.2026, 15:25:15
 function formatDateTime(isoString) {
   if (!isoString) return "—";
   const d = new Date(isoString);
@@ -369,7 +369,7 @@ function localSecret() {
 const JWT_SECRET = localSecret();
 
 /* ==========================================================================
-   Бизнес-логика
+   Бизнес-логика (FG)
    ========================================================================== */
 const app = document.getElementById("app");
 const $ = (id) => document.getElementById(id);
@@ -397,9 +397,7 @@ const FG = (function () {
         });
         console.log("Администратор создан автоматически.");
       }
-    } catch (e) {
-      console.warn("Не удалось проверить/создать администратора.", e.message);
-    }
+    } catch (e) { console.warn("Не удалось проверить/создать администратора.", e.message); }
   }
 
   async function getAuth() {
@@ -447,13 +445,10 @@ const FG = (function () {
       throw new ApiError(401, "Неверный email или пароль");
     }
     const isAdmin = user.email === CONFIG.DEFAULT_ADMIN.email;
-    if (role === "admin" && !isAdmin) {
-      throw new ApiError(403, "Этот аккаунт не является администратором.");
-    }
+    if (role === "admin" && !isAdmin) throw new ApiError(403, "Этот аккаунт не является администратором.");
     if (user.status === "rejected") throw new ApiError(403, "Ваша регистрация отклонена", { status: "rejected" });
     if (user.status === "blocked") throw new ApiError(403, "Ваш аккаунт заблокирован", { status: "blocked" });
     if (user.status !== "pending" && user.status !== "approved") throw new ApiError(403, "Неизвестный статус аккаунта");
-    
     const token = await signToken({ cid: user.client_id, exp: Math.floor(Date.now() / 1000) + SESSION_TTL }, JWT_SECRET);
     return { ok: true, status: user.status, token, isAdmin };
   }
@@ -481,7 +476,6 @@ const FG = (function () {
       const j = await r.json();
       ip = j.ip || "unknown";
     } catch {}
-    // Форматируем дату в нужный вид ПЕРЕД записью в БД
     const formattedDate = formatDateTime(now());
     await DB.insert("AuditLog", {
       id: generateNumericId(), id_client: user.client_id, email: user.email, client_ip: ip,
@@ -517,7 +511,6 @@ const FG = (function () {
       record = files.find((f) => f.file_name === name) || null;
     }
     if (record) {
-      // ЛОГИРОВАНИЕ ПРОВЕРКИ
       await audit(user, record.file_name, "Проверка", record.file_hash, file_hash);
       return {
         result: record.file_hash === file_hash ? "match" : "changed",
@@ -553,7 +546,6 @@ const FG = (function () {
   async function listAudit() {
     const user = await getAuth(); requireApproved(user);
     const rows = await DB.all("AuditLog");
-    // Сортируем по дате. Поскольку мы пишем дату в формате ДД.ММ.ГГГГ, нужно преобразовать для сортировки
     rows.sort((a, b) => {
       const parse = (s) => {
         const m = String(s).match(/^(\d{2})\.(\d{2})\.(\d{4}),\s(\d{2}):(\d{2}):(\d{2})$/);
@@ -849,7 +841,7 @@ async function viewFiles() {
       <div class="card-head"><h2>Проверка и добавление файла</h2></div>
       <div class="dropzone" id="dropzone">
         <div class="big">Перетащите файл сюда или нажмите для выбора</div>
-        <div class="muted">SHA-256 считается в вашем браузере. Система найдёт запись в базе и покажет результат. Если файл изменился — вы сможете обновить запись прямо здесь.</div>
+        <div class="muted">SHA-256 считается в вашем браузере. Система найдёт запись в базе и покажет результат.</div>
       </div>
       <input type="file" id="fileInput" class="hidden">
       <div id="result"></div>
@@ -923,7 +915,7 @@ async function viewFiles() {
         <td>${esc(f.added_by_email || "—")}</td>
         <td class="actions">
           <button class="btn secondary small" data-act="verify" data-id="${esc(f.id)}">Проверить</button>
-          <button class="btn warn small" data-act="update" data-id="${esc(f.id)}">Обновить</button>
+          <button class="btn warn small" data-act="edit" data-id="${esc(f.id)}">Редактировать</button>
           <button class="btn danger small" data-act="delete" data-id="${esc(f.id)}">Удалить</button>
         </td>
       </tr>`).join("");
@@ -965,9 +957,8 @@ async function viewFiles() {
         <dl class="kv"><dt>SHA-256</dt><dd>${hashHtml(r.hash)}</dd><dt>В базе с</dt><dd>${fmtDate(rec.date_added)}</dd></dl></div>`;
     } else if (r.result === "changed") {
       html = `<div class="result changed"><h3>⚠️ Обнаружены изменения</h3>
-        <p>Хэш файла «${esc(r.fileName)}» не совпадает с сохранённым. Вы можете обновить запись прямо сейчас.</p>
-        <dl class="kv"><dt>Хэш в базе</dt><dd>${hashHtml(rec.file_hash)}</dd><dt>Хэш файла</dt><dd>${hashHtml(r.hash)}</dd></dl>
-        <div class="actions"><button class="btn warn" id="resUpdate">Принять новую версию (обновить запись)</button></div></div>`;
+        <p>Хэш файла «${esc(r.fileName)}» не совпадает с сохранённым.</p>
+        <dl class="kv"><dt>Хэш в базе</dt><dd>${hashHtml(rec.file_hash)}</dd><dt>Хэш файла</dt><dd>${hashHtml(r.hash)}</dd></dl></div>`;
     } else if (r.result === "renamed") {
       html = `<div class="result renamed"><h3>ℹ️ Файл найден под другим именем</h3>
         <p>Содержимое совпадает с записью «${esc(rec.file_name)}».</p>
@@ -980,7 +971,6 @@ async function viewFiles() {
     }
     resultBox.innerHTML = html;
     if ($("resAdd")) $("resAdd").onclick = () => addFile(r);
-    if ($("resUpdate")) $("resUpdate").onclick = () => updateRecord(rec, r.hash, r.size);
   }
 
   const working = (t) => { resultBox.innerHTML = `<div class="result unknown"><span class="spinner"></span> ${esc(t)}</div>`; };
@@ -1002,22 +992,59 @@ async function viewFiles() {
       toast("Файл добавлен", "success"); resultBox.innerHTML = ""; await refresh(true);
     } catch (e) { toast(e.message, "error"); }
   }
-  async function updateRecord(rec, hash, size) {
-    try {
-      await FG.updateFile(rec.id, hash, size);
-      toast("Запись обновлена", "success"); resultBox.innerHTML = ""; await refresh(true);
-    } catch (e) { toast(e.message, "error"); }
+  
+  // Редактирование файла онлайн
+  function openEditor(rec) {
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay";
+    overlay.innerHTML = `
+      <div class="modal">
+        <h2>Редактирование файла</h2>
+        <p class="muted">Файл: <strong>${esc(rec.file_name)}</strong></p>
+        <p class="muted" style="font-size:0.85rem">Текущий хэш: <code>${esc(rec.file_hash)}</code></p>
+        <label for="editContent">Новое содержимое файла (текст):</label>
+        <textarea id="editContent" placeholder="Введите новый текст файла..."></textarea>
+        <div class="modal-actions">
+          <button class="btn secondary" id="cancelEdit">Отмена</button>
+          <button class="btn" id="saveEdit">Сохранить</button>
+        </div>
+      </div>
+    `;
+    document.body.appendChild(overlay);
+    
+    const contentInput = overlay.querySelector("#editContent");
+    const cancelBtn = overlay.querySelector("#cancelEdit");
+    const saveBtn = overlay.querySelector("#saveEdit");
+    
+    cancelBtn.onclick = () => document.body.removeChild(overlay);
+    
+    saveBtn.onclick = async () => {
+      const newContent = contentInput.value;
+      if (!newContent.trim()) return toast("Введите содержимое файла", "error");
+      
+      saveBtn.disabled = true; saveBtn.textContent = "Сохранение...";
+      
+      try {
+        // Вычисляем хэш от нового текста
+        const encoder = new TextEncoder();
+        const data = encoder.encode(newContent);
+        const hashBuffer = await crypto.subtle.digest("SHA-256", data);
+        const newHash = Array.from(new Uint8Array(hashBuffer), (b) => b.toString(16).padStart(2, "0")).join("");
+        const newSize = data.length;
+        
+        // Обновляем запись в базе
+        await FG.updateFile(rec.id, newHash, newSize);
+        
+        toast("Файл успешно обновлён", "success");
+        document.body.removeChild(overlay);
+        await refresh(true);
+      } catch (e) {
+        toast(e.message, "error");
+        saveBtn.disabled = false; saveBtn.textContent = "Сохранить";
+      }
+    };
   }
-  async function updateFromFile(file, rec) {
-    if (busy) return; busy = true;
-    try {
-      const hash = await hashFile(file);
-      if (hash === rec.file_hash) { resultBox.innerHTML = ""; return toast("Хэш не изменился", "info"); }
-      if (!confirm(`Обновить запись «${rec.file_name}»?\nБыло: ${rec.file_hash}\nСтало: ${hash}`)) { resultBox.innerHTML = ""; return; }
-      await updateRecord(rec, hash, file.size);
-    } catch (e) { toast(e.message, "error"); resultBox.innerHTML = ""; }
-    finally { busy = false; }
-  }
+
   async function deleteRecord(rec) {
     if (!confirm(`Удалить запись «${rec.file_name}»?`)) return;
     try {
@@ -1039,7 +1066,10 @@ async function viewFiles() {
     if (!b) return;
     const rec = files.find((f) => f.id === b.dataset.id);
     if (!rec) return;
+    
     if (b.dataset.act === "delete") return deleteRecord(rec);
+    if (b.dataset.act === "edit") return openEditor(rec);
+    
     rowAction = { type: b.dataset.act, rec };
     rowInput.click();
   });
@@ -1047,7 +1077,8 @@ async function viewFiles() {
     const f = rowInput.files[0]; rowInput.value = "";
     if (!f || !rowAction) return;
     const { type, rec } = rowAction; rowAction = null;
-    if (type === "verify") checkFile(f, rec.id); else updateFromFile(f, rec);
+    if (type === "verify") checkFile(f, rec.id); 
+    else if (type === "update") { /* Обновление через файл теперь не используется, оставим на случай */ }
   };
   $("fileSearch").addEventListener("input", renderFiles);
   $("auditSearch").addEventListener("input", renderAudit);
