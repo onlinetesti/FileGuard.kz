@@ -21,7 +21,6 @@
   --radius: 12px;
   --mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
 }
-
 * { box-sizing: border-box; }
 html, body { margin: 0; }
 body {
@@ -196,7 +195,14 @@ td.actions { white-space: nowrap; display: flex; gap: 6px; flex-wrap: wrap; }
   .kv { grid-template-columns: 1fr; }
   .auth-card { padding: 22px; }
 }
-
+/* Стили для переключателя ролей */
+.role-switch {
+  display: flex; gap: 6px; margin-bottom: 24px; background: var(--bg); padding: 4px; border-radius: 10px; border: 1px solid var(--border);
+}
+.role-btn {
+  flex: 1; padding: 8px; border: none; background: transparent; color: var(--muted); font-weight: 600; cursor: pointer; border-radius: 8px; transition: all 0.2s;
+}
+.role-btn.active { background: var(--panel-2); color: var(--text); box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
 </style>
 </head>
 <body>
@@ -205,37 +211,31 @@ td.actions { white-space: nowrap; display: flex; gap: 6px; flex-wrap: wrap; }
 
 <script>
 /* ==========================================================================
-   FileGuard — весь проект в одном HTML-файле
+   FileGuard — исправленная версия с раздельным входом
    ==========================================================================
-   НАСТРОЙКИ (достаточно поменять здесь):
-
-   SHEETDB_URL  — адрес вашего API SheetDB (уже вписан).
-   ADMIN_EMAILS — email администратора (можно несколько). Зарегистрируйтесь
-                  с этим email — аккаунт сразу получит права администратора.
-   API_BASE     — оставьте пустым для ПРЯМОГО РЕЖИМА (всё работает прямо из
-                  браузера, на GitHub Pages и т.п.). Если задан адрес вашего
-                  Cloudflare Worker (https://fileguard.xxx.workers.dev) —
-                  файл работает через сервер: ключи скрыты, IP берётся из
-                  CF-Connecting-IP (защищённый режим, как в ТЗ).
+   ВАЖНО:
+   1. Вставьте ваш SHEETDB_TOKEN ниже. Без него запросы будут выдавать 401.
+   2. Проверьте структуру листов в Google Sheets (Users, Hashes, AuditLog).
    ========================================================================== */
 const CONFIG = {
   SHEETDB_URL: "https://sheetdb.io/api/v1/5v95w5jew3777",
-  ADMIN_EMAILS: ["admin@example.com"],
-  API_BASE: "",
+  SHEETDB_TOKEN: "", // <--- ВСТАВЬТЕ СЮДА ТОКЕН ИЗ ПАНЕЛИ SHEETDB
+  // Данные администратора по умолчанию (создадутся при первом запуске)
+  DEFAULT_ADMIN: {
+    email: "admin@fileguard.local",
+    password: "Admin123!" 
+  },
+  API_BASE: "", // Оставьте пустым для прямого режима
 };
 
 /* ==========================================================================
    «СЕРВЕР»: тот же код, что работает в Cloudflare Worker.
-   В прямом режиме выполняется прямо в браузере.
    ========================================================================== */
 const SERVER = (function () {
-// FileGuard — Cloudflare Worker (API + раздача статики)
-// Все операции с Google Sheets идут через SheetDB только отсюда.
-
 const enc = new TextEncoder();
 const dec = new TextDecoder();
-const PBKDF2_ITER = 100000; // максимум, который разрешает Cloudflare Workers
-const SESSION_TTL = 60 * 60 * 12; // 12 часов
+const PBKDF2_ITER = 100000;
+const SESSION_TTL = 60 * 60 * 12;
 const SHA256_RE = /^[a-f0-9]{64}$/;
 const EMAIL_RE = /^[^\s@*]+@[^\s@*]+\.[^\s@*]+$/;
 
@@ -246,8 +246,6 @@ class HttpError extends Error {
     this.extra = extra || {};
   }
 }
-
-/* ---------- утилиты ---------- */
 
 const b64 = {
   enc(buf) {
@@ -304,8 +302,6 @@ async function readJson(req) {
   }
 }
 
-/* ---------- пароли (PBKDF2-SHA256 с солью) ---------- */
-
 async function hashPassword(password, salt = crypto.getRandomValues(new Uint8Array(16)), iter = PBKDF2_ITER) {
   const key = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt, iterations: iter }, key, 256);
@@ -322,8 +318,6 @@ async function verifyPassword(password, stored) {
     return false;
   }
 }
-
-/* ---------- сессионный токен (HMAC-SHA256) ---------- */
 
 const hmacKey = (secret) =>
   crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
@@ -348,8 +342,6 @@ async function verifyToken(token, secret) {
   }
 }
 
-/* ---------- SheetDB ---------- */
-
 function sheetdb(env) {
   const base = env.SHEETDB_URL.replace(/\/+$/, "");
   const baseHeaders = { "Content-Type": "application/json" };
@@ -369,7 +361,11 @@ function sheetdb(env) {
       data = text;
     }
     if (!res.ok) {
-      throw new Error(`SheetDB ${res.status}: ${typeof data === "string" ? data : JSON.stringify(data)}`);
+      let msg = `SheetDB ${res.status}: `;
+      if (res.status === 401) msg += "Неверный токен или нет доступа. Проверьте SHEETDB_TOKEN в настройках.";
+      else if (res.status === 404) msg += "Лист не найден. Проверьте имя листа.";
+      else msg += typeof data === "string" ? data : JSON.stringify(data);
+      throw new Error(msg);
     }
     return data;
   }
@@ -388,7 +384,24 @@ function sheetdb(env) {
   };
 }
 
-/* ---------- авторизация ---------- */
+// Инициализация администратора при первом запуске
+async function ensureAdmin(env, db) {
+  const adminEmail = env.DEFAULT_ADMIN_EMAIL;
+  const existing = await db.find("Users", "email", adminEmail);
+  if (existing.length === 0) {
+    const ts = now();
+    await db.insert("Users", {
+      client_id: crypto.randomUUID(),
+      email: adminEmail,
+      password_hash: await hashPassword(env.DEFAULT_ADMIN_PASSWORD),
+      registration_date: ts,
+      status: "approved",
+      approved_by: "system",
+      approval_date: ts,
+    });
+    console.log("Администратор создан автоматически.");
+  }
+}
 
 function adminEmails(env) {
   return String(env.ADMIN_EMAILS || "")
@@ -398,7 +411,6 @@ function adminEmails(env) {
 }
 const isAdminEmail = (env, email) => adminEmails(env).includes(String(email || "").toLowerCase());
 
-// Пользователь определяется ТОЛЬКО по подписанному токену; статус читается из базы при каждом запросе.
 async function getAuth(req, env, db) {
   const h = req.headers.get("Authorization") || "";
   const token = h.startsWith("Bearer ") ? h.slice(7) : "";
@@ -423,8 +435,6 @@ function requireAdmin(user) {
 
 const clientIp = (req) => req.headers.get("CF-Connecting-IP") || "unknown";
 
-/* ---------- регистрация / вход ---------- */
-
 async function register(req, env, db) {
   const body = await readJson(req);
   const email = String(body.email || "").trim().toLowerCase();
@@ -438,24 +448,24 @@ async function register(req, env, db) {
   const existing = await db.find("Users", "email", email);
   if (existing.length) throw new HttpError(409, "Пользователь с таким email уже зарегистрирован");
 
-  const admin = isAdminEmail(env, email);
   const ts = now();
   await db.insert("Users", {
     client_id: crypto.randomUUID(),
     email,
     password_hash: await hashPassword(password),
     registration_date: ts,
-    status: admin ? "approved" : "pending",
-    approved_by: admin ? "system" : "",
-    approval_date: admin ? ts : "",
+    status: "pending",
+    approved_by: "",
+    approval_date: "",
   });
-  return json({ ok: true, status: admin ? "approved" : "pending" }, 201);
+  return json({ ok: true, status: "pending" }, 201);
 }
 
 async function login(req, env, db) {
   const body = await readJson(req);
   const email = String(body.email || "").trim().toLowerCase();
   const password = String(body.password || "");
+  const role = String(body.role || "user"); // 'user' или 'admin'
   if (!email || !password) throw new HttpError(400, "Введите email и пароль");
 
   const user = (await db.find("Users", "email", email))[0];
@@ -463,14 +473,15 @@ async function login(req, env, db) {
     throw new HttpError(401, "Неверный email или пароль");
   }
 
-  // Администратор из настроек Worker всегда имеет доступ.
-  if (isAdminEmail(env, email) && user.status !== "approved") {
-    user.status = "approved";
-    await db.update("Users", "client_id", user.client_id, {
-      status: "approved",
-      approved_by: "system",
-      approval_date: now(),
-    });
+  // Проверка роли при входе
+  const isAdmin = isAdminEmail(env, user.email);
+  if (role === "admin" && !isAdmin) {
+    throw new HttpError(403, "Этот аккаунт не является администратором.");
+  }
+  if (role === "user" && isAdmin) {
+    // Если админ пытается войти как пользователь, разрешаем, но он всё равно получит права админа
+    // Можно раскомментировать строку ниже, чтобы запретить
+    // throw new HttpError(403, "Пожалуйста, используйте вкладку 'Администратор' для входа.");
   }
 
   if (user.status === "rejected") {
@@ -484,7 +495,7 @@ async function login(req, env, db) {
   }
 
   const token = await signToken({ cid: user.client_id, exp: Math.floor(Date.now() / 1000) + SESSION_TTL }, env.JWT_SECRET);
-  return json({ ok: true, status: user.status, token });
+  return json({ ok: true, status: user.status, token, isAdmin: user.isAdmin });
 }
 
 async function me(req, env, db) {
@@ -496,8 +507,6 @@ async function me(req, env, db) {
     isAdmin: user.isAdmin,
   });
 }
-
-/* ---------- файлы ---------- */
 
 function cleanName(v) {
   const name = String(v || "").split(/[\\/]/).pop().trim();
@@ -648,8 +657,6 @@ async function deleteFile(req, env, db, id) {
   return json({ ok: true });
 }
 
-/* ---------- журнал ---------- */
-
 async function listAudit(req, env, db) {
   const user = await getAuth(req, env, db);
   requireApproved(user);
@@ -668,8 +675,6 @@ async function listAudit(req, env, db) {
   }));
   return json({ events: out, total: rows.length, showIp: user.isAdmin });
 }
-
-/* ---------- панель администратора ---------- */
 
 async function adminListUsers(req, env, db) {
   requireAdmin(await getAuth(req, env, db));
@@ -712,13 +717,15 @@ async function adminAction(req, env, db, clientId, action) {
   return json({ ok: true, status: patch.status });
 }
 
-/* ---------- маршрутизация ---------- */
-
 async function route(req, url, env) {
   if (!env.SHEETDB_URL || !env.JWT_SECRET) {
     throw new HttpError(500, "Сервер не настроен: задайте секреты SHEETDB_URL и JWT_SECRET");
   }
   const db = sheetdb(env);
+  
+  // Инициализация админа при каждом запуске сервера (проверка)
+  await ensureAdmin(env, db);
+
   const p = url.pathname.replace(/\/+$/, "");
   const m = req.method;
 
@@ -781,7 +788,6 @@ const FG = (function () {
     constructor(status, message, data) { super(message); this.status = status; this.data = data || {}; }
   }
 
-  // ключ подписи сессий для прямого режима (хранится только в этом браузере)
   function localSecret() {
     try {
       let s = localStorage.getItem("fileguard_local_secret");
@@ -795,8 +801,11 @@ const FG = (function () {
   }
   const ENV = {
     SHEETDB_URL: CONFIG.SHEETDB_URL,
+    SHEETDB_TOKEN: CONFIG.SHEETDB_TOKEN,
     JWT_SECRET: localSecret(),
-    ADMIN_EMAILS: CONFIG.ADMIN_EMAILS.join(","),
+    ADMIN_EMAILS: CONFIG.DEFAULT_ADMIN.email,
+    DEFAULT_ADMIN_EMAIL: CONFIG.DEFAULT_ADMIN.email,
+    DEFAULT_ADMIN_PASSWORD: CONFIG.DEFAULT_ADMIN.password,
   };
 
   let ipPromise = null;
@@ -837,7 +846,6 @@ const FG = (function () {
     go("#/login" + (reason ? "?reason=" + encodeURIComponent(reason) : ""));
   }
 
-  // Возвращает пользователя или null (и сама перенаправляет куда нужно).
   async function requireUser(opts) {
     opts = opts || {};
     if (!getToken()) { logout(); return null; }
@@ -940,21 +948,49 @@ addEventListener("hashchange", route);
 document.addEventListener("visibilitychange", () => { if (!document.hidden && currentRefresh) currentRefresh(); });
 
 /* ==========================================================================
-   Страница входа
+   Страница входа (с выбором роли)
    ========================================================================== */
 async function viewLogin(q) {
   app.innerHTML = authShell(`
-    <h1>Вход</h1>
-    <p class="sub">Контроль целостности файлов по SHA-256</p>
+    <div class="role-switch" id="roleSwitch">
+      <button class="role-btn active" data-role="user">Пользователь</button>
+      <button class="role-btn" data-role="admin">Администратор</button>
+    </div>
+    <h1 id="loginTitle">Вход для пользователя</h1>
+    <p class="sub" id="loginSub">Контроль целостности файлов по SHA-256</p>
     <div id="notice" class="alert hidden"></div>
     <form id="form" novalidate>
       <div class="field"><label for="email">Email</label><input id="email" type="email" autocomplete="email" required></div>
       <div class="field"><label for="password">Пароль</label><input id="password" type="password" autocomplete="current-password" required></div>
       <button class="btn block" id="submit" type="submit">Войти</button>
     </form>
-    <div class="auth-foot">Нет аккаунта? <a href="#/register">Зарегистрироваться</a></div>`);
+    <div class="auth-foot" id="registerLink">Нет аккаунта? <a href="#/register">Зарегистрироваться</a></div>`);
 
   const notice = $("notice");
+  let currentRole = "user";
+
+  // Обработка переключения ролей
+  $("roleSwitch").addEventListener("click", (e) => {
+    const btn = e.target.closest(".role-btn");
+    if (!btn) return;
+    document.querySelectorAll(".role-btn").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    currentRole = btn.dataset.role;
+    
+    if (currentRole === "admin") {
+      $("loginTitle").textContent = "Вход для администратора";
+      $("loginSub").textContent = "Управление доступом и пользователями";
+      $("registerLink").classList.add("hidden");
+      $("email").value = "";
+      $("password").value = "";
+    } else {
+      $("loginTitle").textContent = "Вход для пользователя";
+      $("loginSub").textContent = "Контроль целостности файлов по SHA-256";
+      $("registerLink").classList.remove("hidden");
+    }
+    notice.classList.add("hidden");
+  });
+
   const show = (msg, type) => { notice.textContent = msg; notice.className = "alert " + type; };
   const reasons = {
     blocked: ["error", "Ваш аккаунт заблокирован администратором."],
@@ -979,7 +1015,7 @@ async function viewLogin(q) {
     if (!email || !password) return show("Введите email и пароль", "error");
     btn.disabled = true; btn.textContent = "Проверяем…";
     try {
-      const res = await api("/login", { method: "POST", body: { email, password } });
+      const res = await api("/login", { method: "POST", body: { email, password, role: currentRole } });
       FG.setToken(res.token);
       FG.go(res.status === "approved" ? "#/files" : "#/pending");
     } catch (err) {
@@ -1335,7 +1371,7 @@ async function viewAdmin() {
 
   function approver(u) {
     if (!u.approved_by) return "—";
-    if (u.approved_by === "system") return "Система (администратор из настроек)";
+    if (u.approved_by === "system") return "Система (администратор по умолчанию)";
     const a = users.find((x) => x.client_id === u.approved_by);
     return esc(a ? a.email : u.approved_by);
   }
