@@ -1,0 +1,13 @@
+{
+  "name": "fileguard",
+  "version": "1.0.0",
+  "private": true,
+  "description": "FileGuard — контроль целостности файлов (SHA-256), Cloudflare Worker + SheetDB",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  }
+}
