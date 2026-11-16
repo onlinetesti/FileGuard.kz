@@ -195,7 +195,6 @@ td.actions { white-space: nowrap; display: flex; gap: 6px; flex-wrap: wrap; }
   .kv { grid-template-columns: 1fr; }
   .auth-card { padding: 22px; }
 }
-/* Стили для переключателя ролей */
 .role-switch {
   display: flex; gap: 6px; margin-bottom: 24px; background: var(--bg); padding: 4px; border-radius: 10px; border: 1px solid var(--border);
 }
@@ -211,62 +210,91 @@ td.actions { white-space: nowrap; display: flex; gap: 6px; flex-wrap: wrap; }
 
 <script>
 /* ==========================================================================
-   FileGuard — исправленная версия с раздельным входом
-   ==========================================================================
-   ВАЖНО:
-   1. Вставьте ваш SHEETDB_TOKEN ниже. Без него запросы будут выдавать 401.
-   2. Проверьте структуру листов в Google Sheets (Users, Hashes, AuditLog).
+   НАСТРОЙКИ
    ========================================================================== */
 const CONFIG = {
   SHEETDB_URL: "https://sheetdb.io/api/v1/5v95w5jew3777",
-  SHEETDB_TOKEN: "", // <--- ВСТАВЬТЕ СЮДА ТОКЕН ИЗ ПАНЕЛИ SHEETDB
-  // Данные администратора по умолчанию (создадутся при первом запуске)
+  // Токен не нужен, если таблица публичная. Оставьте пустым.
+  SHEETDB_TOKEN: "",
   DEFAULT_ADMIN: {
     email: "admin@fileguard.local",
     password: "Admin123!" 
+  }
+};
+
+class ApiError extends Error {
+  constructor(status, message, data) {
+    super(message);
+    this.status = status;
+    this.data = data || {};
+  }
+}
+
+/* ==========================================================================
+   Работа с SheetDB (ИСПРАВЛЕНО: не шлём пустой Authorization)
+   ========================================================================== */
+const DB = {
+  async call(path, sheet, opts = {}) {
+    const base = CONFIG.SHEETDB_URL.replace(/\/+$/, "");
+    const headers = { "Content-Type": "application/json" };
+    
+    // Отправляем токен ТОЛЬКО если он реально есть
+    if (CONFIG.SHEETDB_TOKEN && CONFIG.SHEETDB_TOKEN.trim() !== "") {
+      headers.Authorization = "Bearer " + CONFIG.SHEETDB_TOKEN;
+    }
+
+    const sep = path.includes("?") ? "&" : "?";
+    const url = `${base}${path}${sep}sheet=${encodeURIComponent(sheet)}`;
+
+    let res;
+    try {
+      res = await fetch(url, { ...opts, headers });
+    } catch (e) {
+      throw new ApiError(0, "Нет связи с сервером (SheetDB)");
+    }
+
+    const text = await res.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : null;
+    } catch {
+      data = text;
+    }
+
+    if (!res.ok) {
+      let msg = `SheetDB ${res.status}: `;
+      if (res.status === 401) msg += "Таблица не публичная или неверный токен. Проверьте настройки доступа в SheetDB.";
+      else if (res.status === 404) msg += "Лист не найден. Проверьте имя листа.";
+      else msg += typeof data === "string" ? data : JSON.stringify(data);
+      throw new ApiError(res.status, msg, data);
+    }
+
+    return data;
   },
-  API_BASE: "", // Оставьте пустым для прямого режима
+
+  all: (sheet) => DB.call("", sheet).then(r => Array.isArray(r) ? r : []),
+  find: (sheet, field, value) => DB.call(`/search?${encodeURIComponent(field)}=${encodeURIComponent(value)}&casesensitive=true`, sheet).then(r => Array.isArray(r) ? r : []),
+  insert: (sheet, row) => DB.call("", sheet, { method: "POST", body: JSON.stringify({ data: [row] }) }),
+  update: (sheet, field, value, patch) => DB.call(`/${encodeURIComponent(field)}/${encodeURIComponent(value)}`, sheet, { method: "PATCH", body: JSON.stringify({ data: patch }) }),
+  remove: (sheet, field, value) => DB.call(`/${encodeURIComponent(field)}/${encodeURIComponent(value)}`, sheet, { method: "DELETE" }),
 };
 
 /* ==========================================================================
-   «СЕРВЕР»: тот же код, что работает в Cloudflare Worker.
+   Хэширование и безопасность
    ========================================================================== */
-const SERVER = (function () {
 const enc = new TextEncoder();
-const dec = new TextDecoder();
 const PBKDF2_ITER = 100000;
 const SESSION_TTL = 60 * 60 * 12;
 const SHA256_RE = /^[a-f0-9]{64}$/;
 const EMAIL_RE = /^[^\s@*]+@[^\s@*]+\.[^\s@*]+$/;
 
-class HttpError extends Error {
-  constructor(status, message, extra) {
-    super(message);
-    this.status = status;
-    this.extra = extra || {};
-  }
-}
-
 const b64 = {
-  enc(buf) {
-    let s = "";
-    for (const x of new Uint8Array(buf)) s += String.fromCharCode(x);
-    return btoa(s);
-  },
-  dec(str) {
-    const s = atob(str);
-    const b = new Uint8Array(s.length);
-    for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i);
-    return b;
-  },
+  enc(buf) { let s = ""; for (const x of new Uint8Array(buf)) s += String.fromCharCode(x); return btoa(s); },
+  dec(str) { const s = atob(str); const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i); return b; },
 };
 const b64u = {
   enc: (buf) => b64.enc(buf).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""),
-  dec(str) {
-    str = str.replace(/-/g, "+").replace(/_/g, "/");
-    while (str.length % 4) str += "=";
-    return b64.dec(str);
-  },
+  dec(str) { str = str.replace(/-/g, "+").replace(/_/g, "/"); while (str.length % 4) str += "="; return b64.dec(str); },
 };
 
 function timingSafeEqual(a, b) {
@@ -277,30 +305,6 @@ function timingSafeEqual(a, b) {
 }
 
 const now = () => new Date().toISOString();
-
-function json(data, status = 200, headers = {}) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", ...headers },
-  });
-}
-
-function corsHeaders(env) {
-  return {
-    "Access-Control-Allow-Origin": env.ALLOWED_ORIGIN || "*",
-    "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type,Authorization",
-    "Access-Control-Max-Age": "86400",
-  };
-}
-
-async function readJson(req) {
-  try {
-    return await req.json();
-  } catch {
-    throw new HttpError(400, "Некорректный JSON в запросе");
-  }
-}
 
 async function hashPassword(password, salt = crypto.getRandomValues(new Uint8Array(16)), iter = PBKDF2_ITER) {
   const key = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
@@ -314,605 +318,304 @@ async function verifyPassword(password, stored) {
   try {
     const calc = await hashPassword(password, b64.dec(parts[2]), parseInt(parts[1], 10));
     return timingSafeEqual(calc, stored);
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
-const hmacKey = (secret) =>
-  crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
-
+const hmacKey = (secret) => crypto.subtle.importKey("raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
 async function signToken(payload, secret) {
   const body = b64u.enc(enc.encode(JSON.stringify(payload)));
   const sig = await crypto.subtle.sign("HMAC", await hmacKey(secret), enc.encode(body));
   return body + "." + b64u.enc(sig);
 }
-
 async function verifyToken(token, secret) {
   try {
     const [body, sig] = String(token || "").split(".");
     if (!body || !sig) return null;
     const ok = await crypto.subtle.verify("HMAC", await hmacKey(secret), b64u.dec(sig), enc.encode(body));
     if (!ok) return null;
-    const payload = JSON.parse(dec.decode(b64u.dec(body)));
+    const payload = JSON.parse(new TextDecoder().decode(b64u.dec(body)));
     if (!payload.exp || payload.exp < Date.now() / 1000) return null;
     return payload;
-  } catch {
-    return null;
-  }
+  } catch { return null; }
 }
 
-function sheetdb(env) {
-  const base = env.SHEETDB_URL.replace(/\/+$/, "");
-  const baseHeaders = { "Content-Type": "application/json" };
-  if (env.SHEETDB_TOKEN) baseHeaders.Authorization = "Bearer " + env.SHEETDB_TOKEN;
-
-  async function call(path, sheet, opts = {}) {
-    const sep = path.includes("?") ? "&" : "?";
-    const res = await fetch(`${base}${path}${sep}sheet=${encodeURIComponent(sheet)}`, {
-      ...opts,
-      headers: baseHeaders,
-    });
-    const text = await res.text();
-    let data = null;
-    try {
-      data = text ? JSON.parse(text) : null;
-    } catch {
-      data = text;
-    }
-    if (!res.ok) {
-      let msg = `SheetDB ${res.status}: `;
-      if (res.status === 401) msg += "Неверный токен или нет доступа. Проверьте SHEETDB_TOKEN в настройках.";
-      else if (res.status === 404) msg += "Лист не найден. Проверьте имя листа.";
-      else msg += typeof data === "string" ? data : JSON.stringify(data);
-      throw new Error(msg);
-    }
-    return data;
-  }
-
-  const asArray = (r) => (Array.isArray(r) ? r : []);
-  const q = encodeURIComponent;
-
-  return {
-    all: (sheet) => call("", sheet).then(asArray),
-    find: (sheet, field, value) =>
-      call(`/search?${q(field)}=${q(value)}&casesensitive=true`, sheet).then(asArray),
-    insert: (sheet, row) => call("", sheet, { method: "POST", body: JSON.stringify({ data: [row] }) }),
-    update: (sheet, field, value, patch) =>
-      call(`/${q(field)}/${q(value)}`, sheet, { method: "PATCH", body: JSON.stringify({ data: patch }) }),
-    remove: (sheet, field, value) => call(`/${q(field)}/${q(value)}`, sheet, { method: "DELETE" }),
-  };
-}
-
-// Инициализация администратора при первом запуске
-async function ensureAdmin(env, db) {
-  const adminEmail = env.DEFAULT_ADMIN_EMAIL;
-  const existing = await db.find("Users", "email", adminEmail);
-  if (existing.length === 0) {
-    const ts = now();
-    await db.insert("Users", {
-      client_id: crypto.randomUUID(),
-      email: adminEmail,
-      password_hash: await hashPassword(env.DEFAULT_ADMIN_PASSWORD),
-      registration_date: ts,
-      status: "approved",
-      approved_by: "system",
-      approval_date: ts,
-    });
-    console.log("Администратор создан автоматически.");
-  }
-}
-
-function adminEmails(env) {
-  return String(env.ADMIN_EMAILS || "")
-    .split(",")
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean);
-}
-const isAdminEmail = (env, email) => adminEmails(env).includes(String(email || "").toLowerCase());
-
-async function getAuth(req, env, db) {
-  const h = req.headers.get("Authorization") || "";
-  const token = h.startsWith("Bearer ") ? h.slice(7) : "";
-  const payload = await verifyToken(token, env.JWT_SECRET);
-  if (!payload) throw new HttpError(401, "Требуется авторизация");
-  const user = (await db.find("Users", "client_id", payload.cid))[0];
-  if (!user) throw new HttpError(401, "Пользователь не найден");
-  user.isAdmin = user.status === "approved" && isAdminEmail(env, user.email);
-  return user;
-}
-
-function requireApproved(user) {
-  if (user.status !== "approved") {
-    throw new HttpError(403, "Доступ разрешён только одобренным пользователям", { status: user.status });
-  }
-}
-
-function requireAdmin(user) {
-  requireApproved(user);
-  if (!user.isAdmin) throw new HttpError(403, "Требуются права администратора");
-}
-
-const clientIp = (req) => req.headers.get("CF-Connecting-IP") || "unknown";
-
-async function register(req, env, db) {
-  const body = await readJson(req);
-  const email = String(body.email || "").trim().toLowerCase();
-  const password = String(body.password || "");
-  const confirm = String(body.password_confirm ?? "");
-
-  if (email.length > 254 || !EMAIL_RE.test(email)) throw new HttpError(400, "Введите корректный email");
-  if (password.length < 8 || password.length > 128) throw new HttpError(400, "Пароль должен быть от 8 до 128 символов");
-  if (password !== confirm) throw new HttpError(400, "Пароли не совпадают");
-
-  const existing = await db.find("Users", "email", email);
-  if (existing.length) throw new HttpError(409, "Пользователь с таким email уже зарегистрирован");
-
-  const ts = now();
-  await db.insert("Users", {
-    client_id: crypto.randomUUID(),
-    email,
-    password_hash: await hashPassword(password),
-    registration_date: ts,
-    status: "pending",
-    approved_by: "",
-    approval_date: "",
-  });
-  return json({ ok: true, status: "pending" }, 201);
-}
-
-async function login(req, env, db) {
-  const body = await readJson(req);
-  const email = String(body.email || "").trim().toLowerCase();
-  const password = String(body.password || "");
-  const role = String(body.role || "user"); // 'user' или 'admin'
-  if (!email || !password) throw new HttpError(400, "Введите email и пароль");
-
-  const user = (await db.find("Users", "email", email))[0];
-  if (!user || !(await verifyPassword(password, user.password_hash))) {
-    throw new HttpError(401, "Неверный email или пароль");
-  }
-
-  // Проверка роли при входе
-  const isAdmin = isAdminEmail(env, user.email);
-  if (role === "admin" && !isAdmin) {
-    throw new HttpError(403, "Этот аккаунт не является администратором.");
-  }
-  if (role === "user" && isAdmin) {
-    // Если админ пытается войти как пользователь, разрешаем, но он всё равно получит права админа
-    // Можно раскомментировать строку ниже, чтобы запретить
-    // throw new HttpError(403, "Пожалуйста, используйте вкладку 'Администратор' для входа.");
-  }
-
-  if (user.status === "rejected") {
-    throw new HttpError(403, "Ваша регистрация отклонена администратором", { status: "rejected" });
-  }
-  if (user.status === "blocked") {
-    throw new HttpError(403, "Ваш аккаунт заблокирован администратором", { status: "blocked" });
-  }
-  if (user.status !== "pending" && user.status !== "approved") {
-    throw new HttpError(403, "Неизвестный статус аккаунта", { status: user.status });
-  }
-
-  const token = await signToken({ cid: user.client_id, exp: Math.floor(Date.now() / 1000) + SESSION_TTL }, env.JWT_SECRET);
-  return json({ ok: true, status: user.status, token, isAdmin: user.isAdmin });
-}
-
-async function me(req, env, db) {
-  const user = await getAuth(req, env, db);
-  return json({
-    client_id: user.client_id,
-    email: user.email,
-    status: user.status,
-    isAdmin: user.isAdmin,
-  });
-}
-
-function cleanName(v) {
-  const name = String(v || "").split(/[\\/]/).pop().trim();
-  if (!name || name.length > 255) throw new HttpError(400, "Некорректное имя файла");
-  return name;
-}
-function cleanHash(v) {
-  const h = String(v || "").trim().toLowerCase();
-  if (!SHA256_RE.test(h)) throw new HttpError(400, "Некорректный SHA-256 хэш (нужно 64 hex-символа)");
-  return h;
-}
-function cleanSize(v) {
-  const n = Number(v);
-  if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) throw new HttpError(400, "Некорректный размер файла");
-  return n;
-}
-
-async function audit(db, user, ip, fileName, change, oldHash, newHash) {
-  await db.insert("AuditLog", {
-    id: crypto.randomUUID(),
-    id_client: user.client_id,
-    email: user.email,
-    client_ip: ip,
-    file_name: fileName,
-    change,
-    old_hash: oldHash || "",
-    new_hash: newHash || "",
-    datetime: now(),
-  });
-}
-
-const publicFile = (f, emails) => ({
-  id: f.id,
-  file_name: f.file_name,
-  file_hash: f.file_hash,
-  file_size: Number(f.file_size) || 0,
-  date_added: f.date_added,
-  added_by: f.added_by,
-  added_by_email: emails.get(f.added_by) || "",
-});
-
-async function listFiles(req, env, db) {
-  requireApproved(await getAuth(req, env, db));
-  const [files, users] = await Promise.all([db.all("Hashes"), db.all("Users")]);
-  const emails = new Map(users.map((u) => [u.client_id, u.email]));
-  files.sort((a, b) => String(b.date_added).localeCompare(String(a.date_added)));
-  return json({ files: files.map((f) => publicFile(f, emails)) });
-}
-
-async function addFile(req, env, db) {
-  const user = await getAuth(req, env, db);
-  requireApproved(user);
-  const body = await readJson(req);
-  const file_name = cleanName(body.file_name);
-  const file_hash = cleanHash(body.file_hash);
-  const file_size = cleanSize(body.file_size);
-
-  const files = await db.all("Hashes");
-  const byName = files.find((f) => f.file_name === file_name);
-  if (byName) throw new HttpError(409, `Файл «${file_name}» уже есть в базе. Используйте «Обновить запись».`);
-  const byHash = files.find((f) => f.file_hash === file_hash);
-  if (byHash) throw new HttpError(409, `Файл с таким хэшем уже есть в базе под именем «${byHash.file_name}»`);
-
-  const row = {
-    id: crypto.randomUUID(),
-    file_name,
-    file_hash,
-    file_size: String(file_size),
-    date_added: now(),
-    added_by: user.client_id,
-  };
-  await db.insert("Hashes", row);
+function localSecret() {
   try {
-    await audit(db, user, clientIp(req), file_name, "Добавление", "", file_hash);
-  } catch (e) {
-    console.error(e);
-    try { await db.remove("Hashes", "id", row.id); } catch {}
-    throw new HttpError(502, "Не удалось записать журнал, операция отменена");
-  }
-  return json({ ok: true, file: publicFile(row, new Map([[user.client_id, user.email]])) }, 201);
-}
-
-async function verifyFile(req, env, db) {
-  requireApproved(await getAuth(req, env, db));
-  const body = await readJson(req);
-  const file_hash = cleanHash(body.file_hash);
-  const files = await db.all("Hashes");
-  const users = await db.all("Users");
-  const emails = new Map(users.map((u) => [u.client_id, u.email]));
-
-  let record = null;
-  if (body.id) record = files.find((f) => f.id === String(body.id)) || null;
-  else if (body.file_name) {
-    const name = cleanName(body.file_name);
-    record = files.find((f) => f.file_name === name) || null;
-  }
-
-  if (record) {
-    return json({
-      result: record.file_hash === file_hash ? "match" : "changed",
-      record: publicFile(record, emails),
-    });
-  }
-  if (body.id) throw new HttpError(404, "Запись не найдена");
-
-  const same = files.find((f) => f.file_hash === file_hash);
-  if (same) return json({ result: "renamed", record: publicFile(same, emails) });
-  return json({ result: "unknown" });
-}
-
-async function updateFile(req, env, db, id) {
-  const user = await getAuth(req, env, db);
-  requireApproved(user);
-  const body = await readJson(req);
-  const newHash = cleanHash(body.file_hash);
-  const newSize = cleanSize(body.file_size);
-
-  const record = (await db.find("Hashes", "id", id))[0];
-  if (!record) throw new HttpError(404, "Запись не найдена");
-  if (record.file_hash === newHash) throw new HttpError(409, "Хэш не изменился — обновлять нечего");
-
-  const old = { file_hash: record.file_hash, file_size: record.file_size };
-  await db.update("Hashes", "id", id, { file_hash: newHash, file_size: String(newSize) });
-  try {
-    await audit(db, user, clientIp(req), record.file_name, "Изменение", old.file_hash, newHash);
-  } catch (e) {
-    console.error(e);
-    try { await db.update("Hashes", "id", id, old); } catch {}
-    throw new HttpError(502, "Не удалось записать журнал, операция отменена");
-  }
-  return json({ ok: true });
-}
-
-async function deleteFile(req, env, db, id) {
-  const user = await getAuth(req, env, db);
-  requireApproved(user);
-  const record = (await db.find("Hashes", "id", id))[0];
-  if (!record) throw new HttpError(404, "Запись не найдена");
-
-  await db.remove("Hashes", "id", id);
-  try {
-    await audit(db, user, clientIp(req), record.file_name, "Удаление", record.file_hash, "");
-  } catch (e) {
-    console.error(e);
-    try { await db.insert("Hashes", record); } catch {}
-    throw new HttpError(502, "Не удалось записать журнал, операция отменена");
-  }
-  return json({ ok: true });
-}
-
-async function listAudit(req, env, db) {
-  const user = await getAuth(req, env, db);
-  requireApproved(user);
-  const rows = await db.all("AuditLog");
-  rows.sort((a, b) => String(b.datetime).localeCompare(String(a.datetime)));
-  const out = rows.slice(0, 500).map((r) => ({
-    id: r.id,
-    id_client: r.id_client,
-    email: r.email,
-    client_ip: user.isAdmin ? r.client_ip : "",
-    file_name: r.file_name,
-    change: r.change,
-    old_hash: r.old_hash,
-    new_hash: r.new_hash,
-    datetime: r.datetime,
-  }));
-  return json({ events: out, total: rows.length, showIp: user.isAdmin });
-}
-
-async function adminListUsers(req, env, db) {
-  requireAdmin(await getAuth(req, env, db));
-  const users = await db.all("Users");
-  users.sort((a, b) => String(b.registration_date).localeCompare(String(a.registration_date)));
-  return json({
-    users: users.map((u) => ({
-      client_id: u.client_id,
-      email: u.email,
-      registration_date: u.registration_date,
-      status: u.status,
-      approved_by: u.approved_by,
-      approval_date: u.approval_date,
-      isAdmin: isAdminEmail(env, u.email),
-    })),
-  });
-}
-
-async function adminAction(req, env, db, clientId, action) {
-  const admin = await getAuth(req, env, db);
-  requireAdmin(admin);
-  const target = (await db.find("Users", "client_id", clientId))[0];
-  if (!target) throw new HttpError(404, "Пользователь не найден");
-  if (isAdminEmail(env, target.email)) throw new HttpError(400, "Нельзя менять статус администратора");
-
-  let patch;
-  if (action === "approve") {
-    if (target.status === "approved") throw new HttpError(409, "Пользователь уже одобрен");
-    patch = { status: "approved", approved_by: admin.client_id, approval_date: now() };
-  } else if (action === "reject") {
-    if (target.status !== "pending") throw new HttpError(409, "Отклонить можно только заявку в ожидании");
-    patch = { status: "rejected", approved_by: "", approval_date: "" };
-  } else if (action === "block") {
-    if (target.status !== "approved") throw new HttpError(409, "Заблокировать можно только одобренного пользователя");
-    patch = { status: "blocked" };
-  } else {
-    throw new HttpError(400, "Неизвестное действие");
-  }
-  await db.update("Users", "client_id", clientId, patch);
-  return json({ ok: true, status: patch.status });
-}
-
-async function route(req, url, env) {
-  if (!env.SHEETDB_URL || !env.JWT_SECRET) {
-    throw new HttpError(500, "Сервер не настроен: задайте секреты SHEETDB_URL и JWT_SECRET");
-  }
-  const db = sheetdb(env);
-  
-  // Инициализация админа при каждом запуске сервера (проверка)
-  await ensureAdmin(env, db);
-
-  const p = url.pathname.replace(/\/+$/, "");
-  const m = req.method;
-
-  if (p === "/api/register" && m === "POST") return register(req, env, db);
-  if (p === "/api/login" && m === "POST") return login(req, env, db);
-  if (p === "/api/me" && m === "GET") return me(req, env, db);
-
-  if (p === "/api/files" && m === "GET") return listFiles(req, env, db);
-  if (p === "/api/files" && m === "POST") return addFile(req, env, db);
-  if (p === "/api/files/verify" && m === "POST") return verifyFile(req, env, db);
-  let mt = p.match(/^\/api\/files\/([\w-]+)$/);
-  if (mt && m === "PUT") return updateFile(req, env, db, mt[1]);
-  if (mt && m === "DELETE") return deleteFile(req, env, db, mt[1]);
-
-  if (p === "/api/audit" && m === "GET") return listAudit(req, env, db);
-
-  if (p === "/api/admin/users" && m === "GET") return adminListUsers(req, env, db);
-  mt = p.match(/^\/api\/admin\/users\/([\w-]+)\/(approve|reject|block)$/);
-  if (mt && m === "POST") return adminAction(req, env, db, mt[1], mt[2]);
-
-  throw new HttpError(404, "Метод не найден");
-}
-
-return {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    if (!url.pathname.startsWith("/api/")) {
-      return env.ASSETS ? env.ASSETS.fetch(request) : new Response("Not found", { status: 404 });
+    let s = localStorage.getItem("fileguard_local_secret");
+    if (!s) {
+      const a = crypto.getRandomValues(new Uint8Array(32));
+      s = Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
+      localStorage.setItem("fileguard_local_secret", s);
     }
-    const cors = corsHeaders(env);
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
-    try {
-      const res = await route(request, url, env);
-      for (const [k, v] of Object.entries(cors)) res.headers.set(k, v);
-      return res;
-    } catch (e) {
-      const known = e instanceof HttpError;
-      if (!known) console.error(e);
-      return json(
-        { error: known ? e.message : "Внутренняя ошибка сервера", ...(known ? e.extra : {}) },
-        known ? e.status : 500,
-        cors
-      );
-    }
-  },
-};
-
-})();
+    return s;
+  } catch { return "session-only-" + Math.random().toString(36).slice(2) + Date.now(); }
+}
+const JWT_SECRET = localSecret();
 
 /* ==========================================================================
-   Общие функции
+   Бизнес-логика
    ========================================================================== */
+const app = document.getElementById("app");
+const $ = (id) => document.getElementById(id);
+
 const FG = (function () {
   const TOKEN_KEY = "fileguard_token";
   const getToken = () => { try { return localStorage.getItem(TOKEN_KEY); } catch { return null; } };
   const setToken = (t) => { try { localStorage.setItem(TOKEN_KEY, t); } catch {} };
   const clearToken = () => { try { localStorage.removeItem(TOKEN_KEY); } catch {} };
 
-  class ApiError extends Error {
-    constructor(status, message, data) { super(message); this.status = status; this.data = data || {}; }
-  }
-
-  function localSecret() {
+  async function ensureAdmin() {
+    const adminEmail = CONFIG.DEFAULT_ADMIN.email;
     try {
-      let s = localStorage.getItem("fileguard_local_secret");
-      if (!s) {
-        const a = crypto.getRandomValues(new Uint8Array(32));
-        s = Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
-        localStorage.setItem("fileguard_local_secret", s);
+      const existing = await DB.find("Users", "email", adminEmail);
+      if (existing.length === 0) {
+        const ts = now();
+        await DB.insert("Users", {
+          client_id: crypto.randomUUID(),
+          email: adminEmail,
+          password_hash: await hashPassword(CONFIG.DEFAULT_ADMIN.password),
+          registration_date: ts,
+          status: "approved",
+          approved_by: "system",
+          approval_date: ts,
+        });
+        console.log("Администратор создан автоматически.");
       }
-      return s;
-    } catch { return "session-only-" + Math.random().toString(36).slice(2) + Date.now(); }
-  }
-  const ENV = {
-    SHEETDB_URL: CONFIG.SHEETDB_URL,
-    SHEETDB_TOKEN: CONFIG.SHEETDB_TOKEN,
-    JWT_SECRET: localSecret(),
-    ADMIN_EMAILS: CONFIG.DEFAULT_ADMIN.email,
-    DEFAULT_ADMIN_EMAIL: CONFIG.DEFAULT_ADMIN.email,
-    DEFAULT_ADMIN_PASSWORD: CONFIG.DEFAULT_ADMIN.password,
-  };
-
-  let ipPromise = null;
-  function getIp() {
-    if (!ipPromise) {
-      ipPromise = fetch("https://api.ipify.org?format=json", { signal: AbortSignal.timeout ? AbortSignal.timeout(5000) : undefined })
-        .then((r) => r.json()).then((j) => j.ip || "unknown").catch(() => "unknown");
+    } catch (e) {
+      console.warn("Не удалось проверить/создать администратора (возможно, нет прав на запись).", e.message);
     }
-    return ipPromise;
   }
 
-  async function api(path, opts) {
-    opts = opts || {};
-    const headers = { "Content-Type": "application/json" };
-    const t = getToken();
-    if (t) headers.Authorization = "Bearer " + t;
-    const init = { method: opts.method || "GET", headers, body: opts.body ? JSON.stringify(opts.body) : undefined };
-    let res;
-    try {
-      if (CONFIG.API_BASE) {
-        res = await fetch(CONFIG.API_BASE.replace(/\/+$/, "") + "/api" + path, init);
-      } else {
-        headers["CF-Connecting-IP"] = await getIp();
-        res = await SERVER.fetch(new Request("https://fileguard.local/api" + path, init), ENV);
-      }
-    } catch { throw new ApiError(0, "Нет связи с сервером"); }
-    let data = {};
-    try { data = await res.json(); } catch {}
-    if (!res.ok) throw new ApiError(res.status, data.error || "Ошибка " + res.status, data);
-    return data;
-  }
-
-  function go(hash) {
-    if (location.hash === hash) route(); else location.hash = hash;
-  }
-  function logout(reason) {
-    clearToken();
-    go("#/login" + (reason ? "?reason=" + encodeURIComponent(reason) : ""));
-  }
-
-  async function requireUser(opts) {
-    opts = opts || {};
-    if (!getToken()) { logout(); return null; }
-    let user;
-    try { user = await api("/me"); }
-    catch (e) { if (e.status === 401) { logout("expired"); return null; } throw e; }
-    if (user.status === "blocked" || user.status === "rejected") { logout(user.status); return null; }
-    if (user.status === "pending" && !opts.allowPending) { go("#/pending"); return null; }
+  async function getAuth() {
+    const token = getToken();
+    if (!token) throw new ApiError(401, "Требуется авторизация");
+    const payload = await verifyToken(token, JWT_SECRET);
+    if (!payload) throw new ApiError(401, "Сессия истекла");
+    const user = (await DB.find("Users", "client_id", payload.cid))[0];
+    if (!user) throw new ApiError(401, "Пользователь не найден");
+    user.isAdmin = user.status === "approved" && user.email === CONFIG.DEFAULT_ADMIN.email;
     return user;
   }
 
-  const esc = (v) => String(v == null ? "" : v)
-    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
-
-  function fmtDate(iso) {
-    if (!iso) return "—";
-    const d = new Date(iso);
-    return isNaN(d) ? esc(iso) : d.toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "medium" });
+  function requireApproved(user) {
+    if (user.status !== "approved") throw new ApiError(403, "Доступ разрешён только одобренным пользователям", { status: user.status });
   }
-  function fmtSize(n) {
-    n = Number(n) || 0;
-    if (n < 1024) return n + " Б";
-    const u = ["КБ", "МБ", "ГБ", "ТБ"]; let i = -1;
-    do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
-    return n.toFixed(n < 10 ? 2 : 1) + " " + u[i];
-  }
-  const hashHtml = (h) => !h ? '<span class="muted">—</span>'
-    : '<span class="hash">' + esc(h) + '</span><button class="copy" data-copy="' + esc(h) + '" title="Копировать">⧉</button>';
-
-  async function sha256File(file) {
-    if (!(window.crypto && crypto.subtle)) throw new Error("Браузер не поддерживает SHA-256 (нужен HTTPS или localhost)");
-    const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
-    return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+  function requireAdmin(user) {
+    requireApproved(user);
+    if (!user.isAdmin) throw new ApiError(403, "Требуются права администратора");
   }
 
-  function toast(msg, type) {
-    let box = document.getElementById("toasts");
-    if (!box) { box = document.createElement("div"); box.id = "toasts"; document.body.appendChild(box); }
-    const t = document.createElement("div");
-    t.className = "toast " + (type || "info");
-    t.textContent = msg;
-    box.appendChild(t);
-    setTimeout(() => t.remove(), 4500);
+  async function register(email, password, confirm) {
+    if (email.length > 254 || !EMAIL_RE.test(email)) throw new ApiError(400, "Введите корректный email");
+    if (password.length < 8 || password.length > 128) throw new ApiError(400, "Пароль должен быть от 8 до 128 символов");
+    if (password !== confirm) throw new ApiError(400, "Пароли не совпадают");
+    const existing = await DB.find("Users", "email", email);
+    if (existing.length) throw new ApiError(409, "Пользователь с таким email уже зарегистрирован");
+    const ts = now();
+    await DB.insert("Users", {
+      client_id: crypto.randomUUID(),
+      email,
+      password_hash: await hashPassword(password),
+      registration_date: ts,
+      status: "pending",
+      approved_by: "",
+      approval_date: "",
+    });
+    return { ok: true, status: "pending" };
   }
 
-  document.addEventListener("click", (e) => {
-    const b = e.target.closest("[data-copy]");
-    if (!b) return;
-    const done = () => toast("Хэш скопирован", "success");
-    if (navigator.clipboard) navigator.clipboard.writeText(b.getAttribute("data-copy")).then(done, () => toast("Не удалось скопировать", "error"));
-  });
+  async function login(email, password, role) {
+    if (!email || !password) throw new ApiError(400, "Введите email и пароль");
+    const user = (await DB.find("Users", "email", email))[0];
+    if (!user || !(await verifyPassword(password, user.password_hash))) {
+      throw new ApiError(401, "Неверный email или пароль");
+    }
+    const isAdmin = user.email === CONFIG.DEFAULT_ADMIN.email;
+    if (role === "admin" && !isAdmin) {
+      throw new ApiError(403, "Этот аккаунт не является администратором.");
+    }
+    if (user.status === "rejected") throw new ApiError(403, "Ваша регистрация отклонена", { status: "rejected" });
+    if (user.status === "blocked") throw new ApiError(403, "Ваш аккаунт заблокирован", { status: "blocked" });
+    if (user.status !== "pending" && user.status !== "approved") throw new ApiError(403, "Неизвестный статус аккаунта");
+    
+    const token = await signToken({ cid: user.client_id, exp: Math.floor(Date.now() / 1000) + SESSION_TTL }, JWT_SECRET);
+    return { ok: true, status: user.status, token, isAdmin };
+  }
 
-  const STATUS_RU = { pending: "Ожидает", approved: "Одобрен", rejected: "Отклонён", blocked: "Заблокирован" };
-  return { api, ApiError, getToken, setToken, clearToken, logout, go, requireUser, esc, fmtDate, fmtSize, hashHtml, sha256File, toast, STATUS_RU };
+  async function me() {
+    const user = await getAuth();
+    return { client_id: user.client_id, email: user.email, status: user.status, isAdmin: user.isAdmin };
+  }
+
+  async function listFiles() {
+    requireApproved(await getAuth());
+    const [files, users] = await Promise.all([DB.all("Hashes"), DB.all("Users")]);
+    const emails = new Map(users.map((u) => [u.client_id, u.email]));
+    files.sort((a, b) => String(b.date_added).localeCompare(String(a.date_added)));
+    return { files: files.map(f => ({
+      id: f.id, file_name: f.file_name, file_hash: f.file_hash, file_size: Number(f.file_size) || 0,
+      date_added: f.date_added, added_by: f.added_by, added_by_email: emails.get(f.added_by) || "",
+    })) };
+  }
+
+  async function audit(user, fileName, change, oldHash, newHash) {
+    let ip = "unknown";
+    try {
+      const r = await fetch("https://api.ipify.org?format=json");
+      const j = await r.json();
+      ip = j.ip || "unknown";
+    } catch {}
+    await DB.insert("AuditLog", {
+      id: crypto.randomUUID(), id_client: user.client_id, email: user.email, client_ip: ip,
+      file_name: fileName, change, old_hash: oldHash || "", new_hash: newHash || "", datetime: now(),
+    });
+  }
+
+  const cleanName = (v) => { const name = String(v || "").split(/[\\/]/).pop().trim(); if (!name || name.length > 255) throw new ApiError(400, "Некорректное имя файла"); return name; };
+  const cleanHash = (v) => { const h = String(v || "").trim().toLowerCase(); if (!SHA256_RE.test(h)) throw new ApiError(400, "Некорректный SHA-256 хэш"); return h; };
+  const cleanSize = (v) => { const n = Number(v); if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) throw new ApiError(400, "Некорректный размер файла"); return n; };
+
+  async function addFile(file_name, file_hash, file_size) {
+    const user = await getAuth(); requireApproved(user);
+    file_name = cleanName(file_name); file_hash = cleanHash(file_hash); file_size = cleanSize(file_size);
+    const files = await DB.all("Hashes");
+    if (files.find((f) => f.file_name === file_name)) throw new ApiError(409, `Файл «${file_name}» уже есть в базе.`);
+    if (files.find((f) => f.file_hash === file_hash)) throw new ApiError(409, `Файл с таким хэшем уже есть в базе.`);
+    const row = { id: crypto.randomUUID(), file_name, file_hash, file_size: String(file_size), date_added: now(), added_by: user.client_id };
+    await DB.insert("Hashes", row);
+    await audit(user, file_name, "Добавление", "", file_hash);
+    return { ok: true };
+  }
+
+  async function verifyFile(file_hash, id, file_name) {
+    requireApproved(await getAuth());
+    file_hash = cleanHash(file_hash);
+    const [files, users] = await Promise.all([DB.all("Hashes"), DB.all("Users")]);
+    const emails = new Map(users.map((u) => [u.client_id, u.email]));
+    let record = null;
+    if (id) record = files.find((f) => f.id === String(id)) || null;
+    else if (file_name) {
+      const name = cleanName(file_name);
+      record = files.find((f) => f.file_name === name) || null;
+    }
+    if (record) {
+      return {
+        result: record.file_hash === file_hash ? "match" : "changed",
+        record: { id: record.id, file_name: record.file_name, file_hash: record.file_hash, file_size: Number(record.file_size) || 0, date_added: record.date_added, added_by: record.added_by, added_by_email: emails.get(record.added_by) || "" }
+      };
+    }
+    if (id) throw new ApiError(404, "Запись не найдена");
+    const same = files.find((f) => f.file_hash === file_hash);
+    if (same) return { result: "renamed", record: { id: same.id, file_name: same.file_name, file_hash: same.file_hash, file_size: Number(same.file_size) || 0, date_added: same.date_added, added_by: same.added_by, added_by_email: emails.get(same.added_by) || "" } };
+    return { result: "unknown" };
+  }
+
+  async function updateFile(id, newHash, newSize) {
+    const user = await getAuth(); requireApproved(user);
+    newHash = cleanHash(newHash); newSize = cleanSize(newSize);
+    const record = (await DB.find("Hashes", "id", id))[0];
+    if (!record) throw new ApiError(404, "Запись не найдена");
+    if (record.file_hash === newHash) throw new ApiError(409, "Хэш не изменился — обновлять нечего");
+    await DB.update("Hashes", "id", id, { file_hash: newHash, file_size: String(newSize) });
+    await audit(user, record.file_name, "Изменение", record.file_hash, newHash);
+    return { ok: true };
+  }
+
+  async function deleteFile(id) {
+    const user = await getAuth(); requireApproved(user);
+    const record = (await DB.find("Hashes", "id", id))[0];
+    if (!record) throw new ApiError(404, "Запись не найдена");
+    await DB.remove("Hashes", "id", id);
+    await audit(user, record.file_name, "Удаление", record.file_hash, "");
+    return { ok: true };
+  }
+
+  async function listAudit() {
+    const user = await getAuth(); requireApproved(user);
+    const rows = await DB.all("AuditLog");
+    rows.sort((a, b) => String(b.datetime).localeCompare(String(a.datetime)));
+    const out = rows.slice(0, 500).map((r) => ({
+      id: r.id, id_client: r.id_client, email: r.email, client_ip: user.isAdmin ? r.client_ip : "",
+      file_name: r.file_name, change: r.change, old_hash: r.old_hash, new_hash: r.new_hash, datetime: r.datetime,
+    }));
+    return { events: out, total: rows.length, showIp: user.isAdmin };
+  }
+
+  async function adminListUsers() {
+    requireAdmin(await getAuth());
+    const users = await DB.all("Users");
+    users.sort((a, b) => String(b.registration_date).localeCompare(String(a.registration_date)));
+    return { users: users.map((u) => ({
+      client_id: u.client_id, email: u.email, registration_date: u.registration_date,
+      status: u.status, approved_by: u.approved_by, approval_date: u.approval_date,
+      isAdmin: u.email === CONFIG.DEFAULT_ADMIN.email,
+    })) };
+  }
+
+  async function adminAction(clientId, action) {
+    const admin = await getAuth(); requireAdmin(admin);
+    const target = (await DB.find("Users", "client_id", clientId))[0];
+    if (!target) throw new ApiError(404, "Пользователь не найден");
+    if (target.email === CONFIG.DEFAULT_ADMIN.email) throw new ApiError(400, "Нельзя менять статус администратора");
+    let patch;
+    if (action === "approve") {
+      if (target.status === "approved") throw new ApiError(409, "Пользователь уже одобрен");
+      patch = { status: "approved", approved_by: admin.client_id, approval_date: now() };
+    } else if (action === "reject") {
+      if (target.status !== "pending") throw new ApiError(409, "Отклонить можно только заявку в ожидании");
+      patch = { status: "rejected", approved_by: "", approval_date: "" };
+    } else if (action === "block") {
+      if (target.status !== "approved") throw new ApiError(409, "Заблокировать можно только одобренного пользователя");
+      patch = { status: "blocked" };
+    } else { throw new ApiError(400, "Неизвестное действие"); }
+    await DB.update("Users", "client_id", clientId, patch);
+    return { ok: true, status: patch.status };
+  }
+
+  function logout(reason) {
+    clearToken();
+    const qs = reason ? "?reason=" + encodeURIComponent(reason) : "";
+    location.hash = "#/login" + qs;
+  }
+
+  return { ensureAdmin, register, login, me, listFiles, addFile, verifyFile, updateFile, deleteFile, listAudit, adminListUsers, adminAction, getAuth, logout, getToken, setToken };
 })();
 
-const { api, esc, fmtDate, fmtSize, hashHtml, sha256File, toast, STATUS_RU } = FG;
-const app = document.getElementById("app");
-const $ = (id) => document.getElementById(id);
+/* ==========================================================================
+   UI и Роутинг
+   ========================================================================== */
+function toast(msg, type) {
+  let box = document.getElementById("toasts");
+  if (!box) { box = document.createElement("div"); box.id = "toasts"; document.body.appendChild(box); }
+  const t = document.createElement("div");
+  t.className = "toast " + (type || "info");
+  t.textContent = msg;
+  box.appendChild(t);
+  setTimeout(() => t.remove(), 4500);
+}
 
-/* ---------- роутер ---------- */
+const esc = (v) => String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+const fmtDate = (iso) => { if (!iso) return "—"; const d = new Date(iso); return isNaN(d) ? esc(iso) : d.toLocaleString("ru-RU", { dateStyle: "short", timeStyle: "medium" }); };
+const fmtSize = (n) => { n = Number(n) || 0; if (n < 1024) return n + " Б"; const u = ["КБ", "МБ", "ГБ", "ТБ"]; let i = -1; do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1); return n.toFixed(n < 10 ? 2 : 1) + " " + u[i]; };
+const hashHtml = (h) => !h ? '<span class="muted">—</span>' : '<span class="hash">' + esc(h) + '</span><button class="copy" data-copy="' + esc(h) + '" title="Копировать">⧉</button>';
+const sha256File = async (file) => {
+  if (!(window.crypto && crypto.subtle)) throw new Error("Браузер не поддерживает SHA-256");
+  const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, "0")).join("");
+};
+
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("[data-copy]");
+  if (!b) return;
+  if (navigator.clipboard) navigator.clipboard.writeText(b.getAttribute("data-copy")).then(() => toast("Скопировано", "success"), () => toast("Ошибка", "error"));
+});
+
 const timers = [];
 let currentRefresh = null;
 const every = (fn, ms) => timers.push(setInterval(fn, ms));
-const modeNote = () => '<p class="muted" style="font-size:.78rem;margin:1.2em 0 0;text-align:center">Режим: ' +
-  (CONFIG.API_BASE ? "защищённый сервер (Cloudflare Worker)" : "прямое подключение к SheetDB (учебный)") + "</p>";
-const authShell = (inner) => '<div class="auth-wrap"><div class="auth-card"><div class="brand"><span class="brand-mark">🛡</span> FileGuard</div>' + inner + modeNote() + "</div></div>";
+
+const STATUS_RU = { pending: "Ожидает", approved: "Одобрен", rejected: "Отклонён", blocked: "Заблокирован" };
+const authShell = (inner) => '<div class="auth-wrap"><div class="auth-card"><div class="brand"><span class="brand-mark">🛡</span> FileGuard</div>' + inner + '<p class="muted" style="font-size:.78rem;margin:1.2em 0 0;text-align:center">Прямое подключение к SheetDB</p></div></div>';
 
 function topbar(user, active) {
   return `<header class="topbar">
@@ -947,9 +650,7 @@ async function route() {
 addEventListener("hashchange", route);
 document.addEventListener("visibilitychange", () => { if (!document.hidden && currentRefresh) currentRefresh(); });
 
-/* ==========================================================================
-   Страница входа (с выбором роли)
-   ========================================================================== */
+/* ---------- Вход ---------- */
 async function viewLogin(q) {
   app.innerHTML = authShell(`
     <div class="role-switch" id="roleSwitch">
@@ -969,20 +670,16 @@ async function viewLogin(q) {
   const notice = $("notice");
   let currentRole = "user";
 
-  // Обработка переключения ролей
   $("roleSwitch").addEventListener("click", (e) => {
     const btn = e.target.closest(".role-btn");
     if (!btn) return;
     document.querySelectorAll(".role-btn").forEach((b) => b.classList.remove("active"));
     btn.classList.add("active");
     currentRole = btn.dataset.role;
-    
     if (currentRole === "admin") {
       $("loginTitle").textContent = "Вход для администратора";
       $("loginSub").textContent = "Управление доступом и пользователями";
       $("registerLink").classList.add("hidden");
-      $("email").value = "";
-      $("password").value = "";
     } else {
       $("loginTitle").textContent = "Вход для пользователя";
       $("loginSub").textContent = "Контроль целостности файлов по SHA-256";
@@ -993,8 +690,8 @@ async function viewLogin(q) {
 
   const show = (msg, type) => { notice.textContent = msg; notice.className = "alert " + type; };
   const reasons = {
-    blocked: ["error", "Ваш аккаунт заблокирован администратором."],
-    rejected: ["error", "Ваша регистрация отклонена администратором."],
+    blocked: ["error", "Ваш аккаунт заблокирован."],
+    rejected: ["error", "Ваша регистрация отклонена."],
     expired: ["info", "Сессия истекла. Войдите снова."],
   };
   const r = reasons[q.get("reason")];
@@ -1002,9 +699,9 @@ async function viewLogin(q) {
 
   if (FG.getToken()) {
     try {
-      const u = await api("/me");
-      if (u.status === "approved") return FG.go("#/files");
-      if (u.status === "pending") return FG.go("#/pending");
+      const u = await FG.me();
+      if (u.status === "approved") return location.hash = "#/files";
+      if (u.status === "pending") return location.hash = "#/pending";
     } catch {}
   }
 
@@ -1015,9 +712,9 @@ async function viewLogin(q) {
     if (!email || !password) return show("Введите email и пароль", "error");
     btn.disabled = true; btn.textContent = "Проверяем…";
     try {
-      const res = await api("/login", { method: "POST", body: { email, password, role: currentRole } });
+      const res = await FG.login(email, password, currentRole);
       FG.setToken(res.token);
-      FG.go(res.status === "approved" ? "#/files" : "#/pending");
+      location.hash = res.status === "approved" ? "#/files" : "#/pending";
     } catch (err) {
       show(err.message, "error");
       btn.disabled = false; btn.textContent = "Войти";
@@ -1025,9 +722,7 @@ async function viewLogin(q) {
   });
 }
 
-/* ==========================================================================
-   Страница регистрации
-   ========================================================================== */
+/* ---------- Регистрация ---------- */
 function viewRegister() {
   app.innerHTML = authShell(`
     <div id="done" class="hidden center">
@@ -1038,7 +733,7 @@ function viewRegister() {
     </div>
     <div id="formBox">
       <h1>Регистрация</h1>
-      <p class="sub">Доступ к системе открывается после одобрения администратором</p>
+      <p class="sub">Доступ открывается после одобрения администратором</p>
       <div id="notice" class="alert error hidden"></div>
       <form id="form" novalidate>
         <div class="field"><label for="email">Email</label><input id="email" type="email" autocomplete="email" required></div>
@@ -1062,12 +757,10 @@ function viewRegister() {
     const btn = $("submit");
     btn.disabled = true; btn.textContent = "Отправляем…";
     try {
-      const res = await api("/register", { method: "POST", body: { email, password, password_confirm: password2 } });
+      await FG.register(email, password, password2);
       $("formBox").classList.add("hidden");
       $("done").classList.remove("hidden");
-      $("doneText").textContent = res.status === "approved"
-        ? "Вы зарегистрированы как администратор. Теперь можно войти в систему."
-        : "Регистрация успешно отправлена. Ожидайте подтверждения администратора. После одобрения вы сможете войти в систему.";
+      $("doneText").textContent = "Регистрация успешно отправлена. Ожидайте подтверждения администратора.";
     } catch (e2) {
       err(e2.message);
       btn.disabled = false; btn.textContent = "Отправить заявку";
@@ -1075,38 +768,42 @@ function viewRegister() {
   });
 }
 
-/* ==========================================================================
-   Ожидание одобрения
-   ========================================================================== */
+/* ---------- Ожидание ---------- */
 async function viewPending() {
   app.innerHTML = authShell(`
     <div class="center">
       <div class="big-icon">⏳</div>
       <h1>Ожидаем подтверждения</h1>
-      <p class="sub">Ваша заявка отправлена администратору. Как только она будет одобрена, вы автоматически попадёте в систему — страницу обновлять не нужно.</p>
+      <p class="sub">Ваша заявка отправлена администратору. Как только она будет одобрена, вы автоматически попадёте в систему.</p>
       <p class="muted" id="who"></p>
-      <p class="live"><span class="spinner"></span> Проверяем статус каждые несколько секунд…</p>
+      <p class="live"><span class="spinner"></span> Проверяем статус…</p>
       <button class="btn secondary block" id="logout">Выйти</button>
     </div>`);
   $("logout").onclick = () => FG.logout();
   async function check() {
     try {
-      const u = await FG.requireUser({ allowPending: true });
-      if (!u) return;
+      const u = await FG.me();
       const w = $("who"); if (w) w.textContent = u.email;
-      if (u.status === "approved") FG.go("#/files");
-    } catch {}
+      if (u.status === "approved") location.hash = "#/files";
+    } catch (e) {
+      if (e.status === 401) FG.logout();
+    }
   }
   await check();
   every(check, 8000);
 }
 
-/* ==========================================================================
-   Основная программа: файлы + журнал
-   ========================================================================== */
+/* ---------- Файлы ---------- */
 async function viewFiles() {
-  const user = await FG.requireUser();
-  if (!user) return;
+  let user;
+  try {
+    user = await FG.me();
+    if (user.status !== "approved") return location.hash = "#/pending";
+  } catch (e) {
+    if (e.status === 401) return FG.logout();
+    app.innerHTML = authShell(`<div class="alert error">${esc(e.message)}</div><button class="btn block" onclick="location.reload()">Обновить</button>`);
+    return;
+  }
 
   app.innerHTML = topbar(user, "files") + `
   <main>
@@ -1114,7 +811,7 @@ async function viewFiles() {
       <div class="card-head"><h2>Проверка и добавление файла</h2></div>
       <div class="dropzone" id="dropzone">
         <div class="big">Перетащите файл сюда или нажмите для выбора</div>
-        <div class="muted">SHA-256 считается в вашем браузере — файл никуда не отправляется. Система сама найдёт запись в базе и покажет результат.</div>
+        <div class="muted">SHA-256 считается в вашем браузере. Система найдёт запись в базе.</div>
       </div>
       <input type="file" id="fileInput" class="hidden">
       <div id="result"></div>
@@ -1157,13 +854,13 @@ async function viewFiles() {
 
   async function refresh(silent) {
     try {
-      const [f, a] = await Promise.all([api("/files"), api("/audit")]);
+      const [f, a] = await Promise.all([FG.listFiles(), FG.listAudit()]);
       if (!alive()) return;
       files = f.files; events = a.events; showIp = a.showIp; auditTotal = a.total;
       renderFiles(); renderAudit();
       $("liveFiles").textContent = "обновлено " + new Date().toLocaleTimeString("ru-RU");
     } catch (e) {
-      if (e.status === 401 || e.status === 403) return FG.logout(e.data && e.data.status);
+      if (e.status === 401 || e.status === 403) return FG.logout(e.data?.status);
       if (!silent) toast(e.message, "error");
     }
   }
@@ -1175,8 +872,7 @@ async function viewFiles() {
     const list = files.filter((f) => !q || f.file_name.toLowerCase().includes(q) || f.file_hash.includes(q));
     $("filesCount").textContent = files.length ? "Всего: " + files.length : "";
     if (!list.length) {
-      $("filesBody").innerHTML = '<tr><td colspan="6" class="empty">' +
-        (files.length ? "Ничего не найдено" : "В базе пока нет файлов. Добавьте первый через форму выше.") + "</td></tr>";
+      $("filesBody").innerHTML = '<tr><td colspan="6" class="empty">' + (files.length ? "Ничего не найдено" : "В базе пока нет файлов.") + "</td></tr>";
       return;
     }
     $("filesBody").innerHTML = list.map((f) => `
@@ -1204,8 +900,7 @@ async function viewFiles() {
       return !q || [e.email, e.file_name, e.old_hash, e.new_hash, e.client_ip, e.id_client].some((v) => String(v || "").toLowerCase().includes(q));
     });
     $("auditCount").textContent = auditTotal ? "Записей: " + auditTotal : "";
-    $("auditHead").innerHTML = "<tr><th>Время</th><th>Пользователь</th>" + (showIp ? "<th>IP</th>" : "") +
-      "<th>Файл</th><th>Действие</th><th>Хэш до</th><th>Хэш после</th></tr>";
+    $("auditHead").innerHTML = "<tr><th>Время</th><th>Пользователь</th>" + (showIp ? "<th>IP</th>" : "") + "<th>Файл</th><th>Действие</th><th>Хэш до</th><th>Хэш после</th></tr>";
     if (!list.length) {
       $("auditBody").innerHTML = `<tr><td colspan="${showIp ? 7 : 6}" class="empty">Записей нет</td></tr>`;
       return;
@@ -1227,17 +922,16 @@ async function viewFiles() {
     let html;
     if (r.result === "match") {
       html = `<div class="result match"><h3>✅ Файл не изменён</h3>
-        <p>Хэш файла «${esc(r.fileName)}» совпадает с записью в общей базе.</p>
-        <dl class="kv"><dt>SHA-256</dt><dd>${hashHtml(r.hash)}</dd>
-        <dt>В базе с</dt><dd>${fmtDate(rec.date_added)} (${esc(rec.added_by_email || "—")})</dd></dl></div>`;
+        <p>Хэш файла «${esc(r.fileName)}» совпадает с записью в базе.</p>
+        <dl class="kv"><dt>SHA-256</dt><dd>${hashHtml(r.hash)}</dd><dt>В базе с</dt><dd>${fmtDate(rec.date_added)}</dd></dl></div>`;
     } else if (r.result === "changed") {
       html = `<div class="result changed"><h3>⚠️ Обнаружены изменения</h3>
-        <p>Хэш файла «${esc(r.fileName)}» не совпадает с сохранённым в базе.</p>
+        <p>Хэш файла «${esc(r.fileName)}» не совпадает с сохранённым.</p>
         <dl class="kv"><dt>Хэш в базе</dt><dd>${hashHtml(rec.file_hash)}</dd><dt>Хэш файла</dt><dd>${hashHtml(r.hash)}</dd></dl>
-        <div class="actions"><button class="btn warn" id="resUpdate">Принять новую версию (обновить запись)</button></div></div>`;
+        <div class="actions"><button class="btn warn" id="resUpdate">Принять новую версию</button></div></div>`;
     } else if (r.result === "renamed") {
       html = `<div class="result renamed"><h3>ℹ️ Файл найден под другим именем</h3>
-        <p>Содержимое совпадает с записью «${esc(rec.file_name)}». Файл «${esc(r.fileName)}» в базе отсутствует.</p>
+        <p>Содержимое совпадает с записью «${esc(rec.file_name)}».</p>
         <dl class="kv"><dt>SHA-256</dt><dd>${hashHtml(r.hash)}</dd></dl></div>`;
     } else {
       html = `<div class="result unknown"><h3>ℹ️ Файла нет в базе</h3>
@@ -1251,16 +945,13 @@ async function viewFiles() {
   }
 
   const working = (t) => { resultBox.innerHTML = `<div class="result unknown"><span class="spinner"></span> ${esc(t)}</div>`; };
-  async function hashFile(file) { working("Вычисляем SHA-256 для «" + file.name + "»…"); return sha256File(file); }
+  async function hashFile(file) { working("Вычисляем SHA-256…"); return sha256File(file); }
 
   async function checkFile(file, id) {
-    if (busy) return;
-    busy = true;
+    if (busy) return; busy = true;
     try {
       const hash = await hashFile(file);
-      const body = { file_hash: hash };
-      if (id) body.id = id; else body.file_name = file.name;
-      const r = await api("/files/verify", { method: "POST", body });
+      const r = await FG.verifyFile(hash, id, file.name);
       renderResult({ ...r, hash, fileName: file.name, size: file.size });
     } catch (e) {
       resultBox.innerHTML = `<div class="alert error" style="margin-top:16px">${esc(e.message)}</div>`;
@@ -1268,31 +959,30 @@ async function viewFiles() {
   }
   async function addFile(r) {
     try {
-      await api("/files", { method: "POST", body: { file_name: r.fileName, file_hash: r.hash, file_size: r.size } });
-      toast("Файл добавлен в базу", "success"); resultBox.innerHTML = ""; await refresh(true);
+      await FG.addFile(r.fileName, r.hash, r.size);
+      toast("Файл добавлен", "success"); resultBox.innerHTML = ""; await refresh(true);
     } catch (e) { toast(e.message, "error"); }
   }
   async function updateRecord(rec, hash, size) {
     try {
-      await api("/files/" + encodeURIComponent(rec.id), { method: "PUT", body: { file_hash: hash, file_size: size } });
+      await FG.updateFile(rec.id, hash, size);
       toast("Запись обновлена", "success"); resultBox.innerHTML = ""; await refresh(true);
     } catch (e) { toast(e.message, "error"); }
   }
   async function updateFromFile(file, rec) {
-    if (busy) return;
-    busy = true;
+    if (busy) return; busy = true;
     try {
       const hash = await hashFile(file);
-      if (hash === rec.file_hash) { resultBox.innerHTML = ""; return toast("Хэш не изменился — обновлять нечего", "info"); }
-      if (!confirm(`Обновить запись «${rec.file_name}»?\n\nБыло: ${rec.file_hash}\nСтало: ${hash}`)) { resultBox.innerHTML = ""; return; }
+      if (hash === rec.file_hash) { resultBox.innerHTML = ""; return toast("Хэш не изменился", "info"); }
+      if (!confirm(`Обновить запись «${rec.file_name}»?\nБыло: ${rec.file_hash}\nСтало: ${hash}`)) { resultBox.innerHTML = ""; return; }
       await updateRecord(rec, hash, file.size);
     } catch (e) { toast(e.message, "error"); resultBox.innerHTML = ""; }
     finally { busy = false; }
   }
   async function deleteRecord(rec) {
-    if (!confirm(`Удалить запись «${rec.file_name}» из общей базы?\nДействие попадёт в журнал.`)) return;
+    if (!confirm(`Удалить запись «${rec.file_name}»?`)) return;
     try {
-      await api("/files/" + encodeURIComponent(rec.id), { method: "DELETE" });
+      await FG.deleteFile(rec.id);
       toast("Запись удалена", "success"); await refresh(true);
     } catch (e) { toast(e.message, "error"); }
   }
@@ -1333,13 +1023,17 @@ async function viewFiles() {
   every(() => { if (!document.hidden && !busy) refresh(true); }, 15000);
 }
 
-/* ==========================================================================
-   Панель администратора
-   ========================================================================== */
+/* ---------- Админка ---------- */
 async function viewAdmin() {
-  const me = await FG.requireUser();
-  if (!me) return;
-  if (!me.isAdmin) return FG.go("#/files");
+  let me;
+  try {
+    me = await FG.me();
+    if (!me.isAdmin) return location.hash = "#/files";
+  } catch (e) {
+    if (e.status === 401) return FG.logout();
+    app.innerHTML = authShell(`<div class="alert error">${esc(e.message)}</div>`);
+    return;
+  }
 
   app.innerHTML = topbar(me, "admin") + `
   <main>
@@ -1371,7 +1065,7 @@ async function viewAdmin() {
 
   function approver(u) {
     if (!u.approved_by) return "—";
-    if (u.approved_by === "system") return "Система (администратор по умолчанию)";
+    if (u.approved_by === "system") return "Система";
     const a = users.find((x) => x.client_id === u.approved_by);
     return esc(a ? a.email : u.approved_by);
   }
@@ -1387,12 +1081,10 @@ async function viewAdmin() {
   function render() {
     if (!alive()) return;
     const count = (s) => users.filter((u) => u.status === s).length;
-    $("stats").innerHTML = [["Всего", users.length], ["Ожидают", count("pending")], ["Одобрены", count("approved")],
-      ["Отклонены", count("rejected")], ["Заблокированы", count("blocked")]]
+    $("stats").innerHTML = [["Всего", users.length], ["Ожидают", count("pending")], ["Одобрены", count("approved")], ["Отклонены", count("rejected")], ["Заблокированы", count("blocked")]]
       .map(([l, n]) => `<div class="stat"><div class="n">${n}</div><div class="l">${l}</div></div>`).join("");
     const q = $("search").value.trim().toLowerCase();
-    const list = users.filter((u) => (!filter || u.status === filter) &&
-      (!q || u.email.toLowerCase().includes(q) || u.client_id.toLowerCase().includes(q)));
+    const list = users.filter((u) => (!filter || u.status === filter) && (!q || u.email.toLowerCase().includes(q) || u.client_id.toLowerCase().includes(q)));
     if (!list.length) { $("body").innerHTML = '<tr><td colspan="7" class="empty">Пользователей нет</td></tr>'; return; }
     $("body").innerHTML = list.map((u) => `
       <tr>
@@ -1407,7 +1099,7 @@ async function viewAdmin() {
   }
   async function load(silent) {
     try {
-      const r = await api("/admin/users");
+      const r = await FG.adminListUsers();
       if (!alive()) return;
       users = r.users; render();
       $("live").textContent = "обновлено " + new Date().toLocaleTimeString("ru-RU");
@@ -1427,7 +1119,7 @@ async function viewAdmin() {
     if (!confirm(`${verbs[b.dataset.act]} пользователя ${u.email}?`)) return;
     b.disabled = true;
     try {
-      await api(`/admin/users/${encodeURIComponent(u.client_id)}/${b.dataset.act}`, { method: "POST" });
+      await FG.adminAction(u.client_id, b.dataset.act);
       toast("Готово", "success");
     } catch (err) { toast(err.message, "error"); }
     load(true);
@@ -1444,7 +1136,11 @@ async function viewAdmin() {
   every(() => { if (!document.hidden) load(true); }, 10000);
 }
 
-route();
+// Запуск
+(async () => {
+  await FG.ensureAdmin();
+  route();
+})();
 </script>
 </body>
 </html>
