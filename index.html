@@ -204,7 +204,7 @@ td.actions { white-space: nowrap; display: flex; gap: 6px; flex-wrap: wrap; }
 }
 .role-btn.active { background: var(--panel-2); color: var(--text); box-shadow: 0 2px 4px rgba(0,0,0,0.2); }
 
-/* Модальное окно для редактирования */
+/* Модальное окно */
 .modal-overlay {
   position: fixed; top: 0; left: 0; right: 0; bottom: 0;
   background: rgba(0,0,0,0.7); display: grid; place-items: center; z-index: 100;
@@ -216,6 +216,8 @@ td.actions { white-space: nowrap; display: flex; gap: 6px; flex-wrap: wrap; }
 .modal h2 { margin-top: 0; }
 .modal textarea { min-height: 150px; resize: vertical; margin-bottom: 1em; }
 .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+.file-link { color: var(--info); cursor: pointer; text-decoration: underline; }
+.file-link:hover { color: var(--accent); }
 </style>
 </head>
 <body>
@@ -227,13 +229,14 @@ td.actions { white-space: nowrap; display: flex; gap: 6px; flex-wrap: wrap; }
    НАСТРОЙКИ
    ========================================================================== */
 const CONFIG = {
-  // ВАШ НОВЫЙ API
   SHEETDB_URL: "https://sheetdb.io/api/v1/s4vw7333lauzm",
   SHEETDB_TOKEN: "", 
   DEFAULT_ADMIN: {
     email: "admin@fileguard.local",
     password: "Admin123!" 
-  }
+  },
+  // Прокси для обхода CORS при скачивании с Google Диска
+  CORS_PROXY: "https://api.allorigins.win/raw?url="
 };
 
 class ApiError extends Error {
@@ -466,6 +469,7 @@ const FG = (function () {
     return { files: files.map(f => ({
       id: f.id, file_name: f.file_name, file_hash: f.file_hash, file_size: Number(f.file_size) || 0,
       date_added: f.date_added, added_by: f.added_by, added_by_email: emails.get(f.added_by) || "",
+      gdrive_url: f.gdrive_url || "", // Ссылка на Google Диск
     })) };
   }
 
@@ -487,13 +491,21 @@ const FG = (function () {
   const cleanHash = (v) => { const h = String(v || "").trim().toLowerCase(); if (!SHA256_RE.test(h)) throw new ApiError(400, "Некорректный SHA-256 хэш"); return h; };
   const cleanSize = (v) => { const n = Number(v); if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) throw new ApiError(400, "Некорректный размер файла"); return n; };
 
-  async function addFile(file_name, file_hash, file_size) {
+  async function addFile(file_name, file_hash, file_size, gdrive_url) {
     const user = await getAuth(); requireApproved(user);
     file_name = cleanName(file_name); file_hash = cleanHash(file_hash); file_size = cleanSize(file_size);
     const files = await DB.all("Hashes");
     if (files.find((f) => f.file_name === file_name)) throw new ApiError(409, `Файл «${file_name}» уже есть в базе.`);
     if (files.find((f) => f.file_hash === file_hash)) throw new ApiError(409, `Файл с таким хэшем уже есть в базе.`);
-    const row = { id: generateNumericId(), file_name, file_hash, file_size: String(file_size), date_added: now(), added_by: user.client_id };
+    const row = { 
+      id: generateNumericId(), 
+      file_name, 
+      file_hash, 
+      file_size: String(file_size), 
+      date_added: now(), 
+      added_by: user.client_id,
+      gdrive_url: gdrive_url || ""
+    };
     await DB.insert("Hashes", row);
     await audit(user, file_name, "Добавление", "", file_hash);
     return { ok: true };
@@ -514,22 +526,44 @@ const FG = (function () {
       await audit(user, record.file_name, "Проверка", record.file_hash, file_hash);
       return {
         result: record.file_hash === file_hash ? "match" : "changed",
-        record: { id: record.id, file_name: record.file_name, file_hash: record.file_hash, file_size: Number(record.file_size) || 0, date_added: record.date_added, added_by: record.added_by, added_by_email: emails.get(record.added_by) || "" }
+        record: { 
+          id: record.id, 
+          file_name: record.file_name, 
+          file_hash: record.file_hash, 
+          file_size: Number(record.file_size) || 0, 
+          date_added: record.date_added, 
+          added_by: record.added_by, 
+          added_by_email: emails.get(record.added_by) || "",
+          gdrive_url: record.gdrive_url || ""
+        }
       };
     }
     if (id) throw new ApiError(404, "Запись не найдена");
     const same = files.find((f) => f.file_hash === file_hash);
-    if (same) return { result: "renamed", record: { id: same.id, file_name: same.file_name, file_hash: same.file_hash, file_size: Number(same.file_size) || 0, date_added: same.date_added, added_by: same.added_by, added_by_email: emails.get(same.added_by) || "" } };
+    if (same) return { result: "renamed", record: { 
+      id: same.id, 
+      file_name: same.file_name, 
+      file_hash: same.file_hash, 
+      file_size: Number(same.file_size) || 0, 
+      date_added: same.date_added, 
+      added_by: same.added_by, 
+      added_by_email: emails.get(same.added_by) || "",
+      gdrive_url: same.gdrive_url || ""
+    } };
     return { result: "unknown" };
   }
 
-  async function updateFile(id, newHash, newSize) {
+  async function updateFile(id, newHash, newSize, gdrive_url) {
     const user = await getAuth(); requireApproved(user);
     newHash = cleanHash(newHash); newSize = cleanSize(newSize);
     const record = (await DB.find("Hashes", "id", id))[0];
     if (!record) throw new ApiError(404, "Запись не найдена");
-    if (record.file_hash === newHash) throw new ApiError(409, "Хэш не изменился — обновлять нечего");
-    await DB.update("Hashes", "id", id, { file_hash: newHash, file_size: String(newSize) });
+    if (record.file_hash === newHash && record.gdrive_url === gdrive_url) throw new ApiError(409, "Данные не изменились — обновлять нечего");
+    
+    const patch = { file_hash: newHash, file_size: String(newSize) };
+    if (gdrive_url !== undefined) patch.gdrive_url = gdrive_url;
+    
+    await DB.update("Hashes", "id", id, patch);
     await audit(user, record.file_name, "Изменение", record.file_hash, newHash);
     return { ok: true };
   }
@@ -908,7 +942,10 @@ async function viewFiles() {
     }
     $("filesBody").innerHTML = list.map((f) => `
       <tr>
-        <td><strong>${esc(f.file_name)}</strong></td>
+        <td>
+          <strong>${esc(f.file_name)}</strong>
+          ${f.gdrive_url ? `<a href="${esc(f.gdrive_url)}" target="_blank" class="file-link" title="Открыть в Google Диске"> (GDrive 🔗)</a>` : ""}
+        </td>
         <td class="hash-col">${hashHtml(f.file_hash)}</td>
         <td>${fmtSize(f.file_size)}</td>
         <td>${fmtDate(f.date_added)}</td>
@@ -917,6 +954,7 @@ async function viewFiles() {
           <button class="btn secondary small" data-act="verify" data-id="${esc(f.id)}">Проверить</button>
           <button class="btn warn small" data-act="edit" data-id="${esc(f.id)}">Редактировать</button>
           <button class="btn danger small" data-act="delete" data-id="${esc(f.id)}">Удалить</button>
+          ${f.gdrive_url ? `<button class="btn info small" data-act="sync" data-id="${esc(f.id)}" title="Синхронизировать с GDrive">🔄</button>` : ""}
         </td>
       </tr>`).join("");
   }
@@ -1004,6 +1042,10 @@ async function viewFiles() {
         <p class="muted" style="font-size:0.85rem">Текущий хэш: <code>${esc(rec.file_hash)}</code></p>
         <label for="editContent">Новое содержимое файла (текст):</label>
         <textarea id="editContent" placeholder="Введите новый текст файла..."></textarea>
+        <div class="field" style="margin-top:10px">
+          <label>Ссылка на Google Диск (необязательно):</label>
+          <input type="text" id="editGdrive" value="${esc(rec.gdrive_url || '')}" placeholder="https://drive.google.com/file/d/...">
+        </div>
         <div class="modal-actions">
           <button class="btn secondary" id="cancelEdit">Отмена</button>
           <button class="btn" id="saveEdit">Сохранить</button>
@@ -1013,6 +1055,7 @@ async function viewFiles() {
     document.body.appendChild(overlay);
     
     const contentInput = overlay.querySelector("#editContent");
+    const gdriveInput = overlay.querySelector("#editGdrive");
     const cancelBtn = overlay.querySelector("#cancelEdit");
     const saveBtn = overlay.querySelector("#saveEdit");
     
@@ -1025,15 +1068,14 @@ async function viewFiles() {
       saveBtn.disabled = true; saveBtn.textContent = "Сохранение...";
       
       try {
-        // Вычисляем хэш от нового текста
         const encoder = new TextEncoder();
         const data = encoder.encode(newContent);
         const hashBuffer = await crypto.subtle.digest("SHA-256", data);
         const newHash = Array.from(new Uint8Array(hashBuffer), (b) => b.toString(16).padStart(2, "0")).join("");
         const newSize = data.length;
+        const gdriveUrl = gdriveInput.value.trim();
         
-        // Обновляем запись в базе
-        await FG.updateFile(rec.id, newHash, newSize);
+        await FG.updateFile(rec.id, newHash, newSize, gdriveUrl);
         
         toast("Файл успешно обновлён", "success");
         document.body.removeChild(overlay);
@@ -1043,6 +1085,38 @@ async function viewFiles() {
         saveBtn.disabled = false; saveBtn.textContent = "Сохранить";
       }
     };
+  }
+
+  // Синхронизация с Google Диском
+  async function syncFromGDrive(rec) {
+    if (!rec.gdrive_url) return toast("Нет ссылки на Google Диск", "error");
+    if (busy) return;
+    busy = true;
+    toast("Синхронизация с Google Диском...", "info");
+    
+    try {
+      // Пытаемся скачать файл через прокси
+      const res = await fetch(CONFIG.CORS_PROXY + encodeURIComponent(rec.gdrive_url));
+      if (!res.ok) throw new Error("Не удалось скачать файл с Google Диска (проверьте доступ)");
+      
+      const blob = await res.blob();
+      const file = new File([blob], rec.file_name);
+      const hash = await sha256File(file);
+      
+      if (hash === rec.file_hash) {
+        toast("Файл на Google Диске не изменился", "info");
+      } else {
+        if (confirm(`Файл на Google Диске изменился!\n\nБыло: ${rec.file_hash}\nСтало: ${hash}\n\nОбновить запись в базе?`)) {
+          await FG.updateFile(rec.id, hash, file.size, rec.gdrive_url);
+          toast("Запись обновлена по данным с Google Диска", "success");
+        }
+      }
+      await refresh(true);
+    } catch (e) {
+      toast(e.message, "error");
+    } finally {
+      busy = false;
+    }
   }
 
   async function deleteRecord(rec) {
@@ -1069,6 +1143,7 @@ async function viewFiles() {
     
     if (b.dataset.act === "delete") return deleteRecord(rec);
     if (b.dataset.act === "edit") return openEditor(rec);
+    if (b.dataset.act === "sync") return syncFromGDrive(rec);
     
     rowAction = { type: b.dataset.act, rec };
     rowInput.click();
@@ -1078,7 +1153,6 @@ async function viewFiles() {
     if (!f || !rowAction) return;
     const { type, rec } = rowAction; rowAction = null;
     if (type === "verify") checkFile(f, rec.id); 
-    else if (type === "update") { /* Обновление через файл теперь не используется, оставим на случай */ }
   };
   $("fileSearch").addEventListener("input", renderFiles);
   $("auditSearch").addEventListener("input", renderAudit);
